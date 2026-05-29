@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node src/promid-monitor.js",
+    "bootstrap:session": "node src/promid-monitor.js --bootstrap-session",
     "once:start": "node src/promid-monitor.js --once start",
     "once:lunch": "node src/promid-monitor.js --once lunch",
     "once:stop": "node src/promid-monitor.js --once stop"

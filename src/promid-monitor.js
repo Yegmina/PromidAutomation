@@ -36,6 +36,7 @@ const config = {
 const args = process.argv.slice(2);
 const onceIndex = args.indexOf('--once');
 const onceAction = onceIndex >= 0 ? args[onceIndex + 1] : undefined;
+const bootstrapSession = args.includes('--bootstrap-session');
 const jitterOffsets = new Map();
 
 let runtimeState = defaultRuntimeState();
@@ -54,6 +55,11 @@ async function main() {
   validateConfig();
   runtimeState = await loadRuntimeState();
   telegramState = await loadTelegramState();
+
+  if (bootstrapSession) {
+    await bootstrapLoginSession();
+    return;
+  }
 
   if (onceAction) {
     if (!['start', 'lunch', 'stop'].includes(onceAction)) {
@@ -153,6 +159,22 @@ async function openSession() {
 
   await ensureLoggedIn(page, context);
   return { browser, context, page };
+}
+
+async function bootstrapLoginSession() {
+  let session;
+  try {
+    session = await openSession();
+    await safeGoto(session.page, config.url);
+    await session.page.waitForLoadState('networkidle').catch(() => {});
+    const state = await detectPromidState(session.page);
+    await session.context.storageState({ path: config.statePath });
+    await emit(`Saved Promid session to ${config.statePath}. Current state: ${state.name} (${state.reason}).`);
+  } finally {
+    if (session) {
+      await session.browser.close().catch(() => {});
+    }
+  }
 }
 
 async function runActionWithRetries(action, context = {}) {
@@ -381,7 +403,7 @@ async function waitForPromidOrAdfsCompletion(page, timeoutMs) {
 
 function adfsHelpMessage(currentUrl) {
   if (/adfs\.metropolia\.fi/i.test(currentUrl)) {
-    return `ADFS login did not complete. The server may need a saved browser session or MFA/first-login bootstrap. Run once locally with PROMID_HEADLESS=false, complete login, then copy .auth/promid-state.json to the server. Current URL: ${currentUrl}`;
+    return `ADFS login did not complete. The server may need a saved browser session or MFA/first-login bootstrap. Run npm run bootstrap:session locally with PROMID_HEADLESS=false, complete login, then copy .auth/promid-state.json to the server. Current URL: ${currentUrl}`;
   }
   return `Login did not reach the Promid stamping page. Current URL: ${currentUrl}`;
 }

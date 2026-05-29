@@ -108,6 +108,21 @@ npm ci
 npx playwright install chromium
 ```
 
+Bootstrap the saved browser session on a machine with a visible browser:
+
+```bash
+PROMID_HEADLESS=false npm run bootstrap:session
+```
+
+Windows PowerShell:
+
+```powershell
+$env:PROMID_HEADLESS='false'
+npm run bootstrap:session
+```
+
+Complete ADFS/MFA if prompted. This only logs in and saves `.auth/promid-state.json`; it does not press attendance buttons.
+
 Test safely without clicking:
 
 ```bash
@@ -176,10 +191,10 @@ docker compose run --rm -e PROMID_DRY_RUN=true promid-monitor npm run once:lunch
 If Docker stays on `https://adfs.metropolia.fi/...`, the server needs a saved login session. Bootstrap it on a machine where a browser window is visible:
 
 ```bash
-PROMID_HEADLESS=false PROMID_DRY_RUN=true npm run once:lunch
+PROMID_HEADLESS=false npm run bootstrap:session
 ```
 
-Complete the ADFS/MFA flow in the opened browser. Then copy the generated session file to the server:
+Complete the ADFS/MFA flow in the opened browser. This command does not press attendance buttons. Then copy the generated session file to the server:
 
 ```bash
 scp .auth/promid-state.json user@server:/path/to/PromidAutomation/.auth/promid-state.json
