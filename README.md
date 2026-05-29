@@ -160,6 +160,13 @@ Build:
 docker compose build
 ```
 
+After pulling updates that change Playwright, rebuild without cache:
+
+```bash
+docker compose build --no-cache
+docker compose up -d
+```
+
 Safe test without clicking:
 
 ```bash
