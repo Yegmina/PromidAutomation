@@ -173,6 +173,25 @@ Safe test without clicking:
 docker compose run --rm -e PROMID_DRY_RUN=true promid-monitor npm run once:lunch
 ```
 
+If Docker stays on `https://adfs.metropolia.fi/...`, the server needs a saved login session. Bootstrap it on a machine where a browser window is visible:
+
+```bash
+PROMID_HEADLESS=false PROMID_DRY_RUN=true npm run once:lunch
+```
+
+Complete the ADFS/MFA flow in the opened browser. Then copy the generated session file to the server:
+
+```bash
+scp .auth/promid-state.json user@server:/path/to/PromidAutomation/.auth/promid-state.json
+```
+
+After copying the session, restart the container:
+
+```bash
+docker compose down
+docker compose up -d
+```
+
 Run attached:
 
 ```bash

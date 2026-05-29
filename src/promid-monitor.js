@@ -216,30 +216,35 @@ async function ensureLoggedIn(page, context) {
   const adfsButton = page.getByRole('button', { name: 'ADFS kirjautuminen' });
   if (await isVisible(adfsButton)) {
     await adfsButton.click();
-    await page.waitForLoadState('domcontentloaded');
+    await page.waitForLoadState('domcontentloaded').catch(() => {});
   }
 
-  const userField = page.getByLabel('User Account');
-  const passwordField = page.getByLabel('Password');
-  if (await isVisible(userField)) {
+  const userField = await findVisibleLocator(page, adfsUserLocators(page), 30_000);
+  if (userField) {
+    const passwordField = await findVisibleLocator(page, adfsPasswordLocators(page), 10_000);
+    const signInButton = await findVisibleLocator(page, adfsSubmitLocators(page), 10_000);
+    if (!passwordField || !signInButton) {
+      throw retryableError(`ADFS login form is incomplete. Current URL: ${page.url()}`);
+    }
+
     await userField.fill(config.email);
     await passwordField.fill(config.password);
-    await page.getByRole('button', { name: 'Sign in' }).click();
-    await page.waitForLoadState('domcontentloaded');
+    await signInButton.click();
+    await page.waitForLoadState('domcontentloaded').catch(() => {});
 
     await emit('If your organization requires MFA, complete it in the browser window.');
-    await page.waitForURL(/promid\.fi/i, { timeout: 120_000 }).catch(() => {});
+    await waitForPromidOrAdfsCompletion(page, 120_000);
     await page.waitForLoadState('domcontentloaded').catch(() => {});
   }
 
   if (!/promid\.fi/i.test(page.url())) {
-    throw retryableError(`Login may still be in progress. Current URL: ${page.url()}`);
+    throw retryableError(adfsHelpMessage(page.url()));
   }
 
   const stillOnPromidLogin = page.getByRole('button', { name: 'ADFS kirjautuminen' });
-  const stillOnAdfsLogin = page.getByLabel('User Account');
+  const stillOnAdfsLogin = await findVisibleLocator(page, adfsUserLocators(page), 1000);
   if (await isVisible(stillOnPromidLogin) || await isVisible(stillOnAdfsLogin)) {
-    throw retryableError(`Login did not reach the Promid stamping page. Current URL: ${page.url()}`);
+    throw retryableError(adfsHelpMessage(page.url()));
   }
 
   await fs.mkdir(path.dirname(config.statePath), { recursive: true });
@@ -312,6 +317,73 @@ async function safeGoto(page, url) {
     }
     await page.waitForLoadState('domcontentloaded').catch(() => {});
   }
+}
+
+function adfsUserLocators(page) {
+  return [
+    page.getByLabel('User Account'),
+    page.getByPlaceholder('someone@example.com'),
+    page.locator('input#userNameInput'),
+    page.locator('input[name="UserName"]'),
+    page.locator('input[type="email"]'),
+    page.locator('input[type="text"]')
+  ];
+}
+
+function adfsPasswordLocators(page) {
+  return [
+    page.getByLabel('Password'),
+    page.locator('input#passwordInput'),
+    page.locator('input[name="Password"]'),
+    page.locator('input[type="password"]')
+  ];
+}
+
+function adfsSubmitLocators(page) {
+  return [
+    page.getByRole('button', { name: 'Sign in' }),
+    page.locator('input#submitButton'),
+    page.locator('button[type="submit"]'),
+    page.locator('input[type="submit"]')
+  ];
+}
+
+async function findVisibleLocator(page, locators, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    for (const locator of locators) {
+      if (await isVisible(locator)) {
+        return locator;
+      }
+    }
+    await page.waitForTimeout(500);
+  }
+  return undefined;
+}
+
+async function waitForPromidOrAdfsCompletion(page, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    if (/promid\.fi/i.test(page.url())) return;
+
+    const userField = await findVisibleLocator(page, adfsUserLocators(page), 500);
+    const passwordField = await findVisibleLocator(page, adfsPasswordLocators(page), 500);
+    if (userField && passwordField) {
+      const bodyText = await page.locator('body').innerText({ timeout: 1000 }).catch(() => '');
+      if (/incorrect|invalid|failed|virhe|väär/i.test(bodyText)) {
+        throw retryableError(`ADFS did not accept the login. Check PROMID_EMAIL/PROMID_PASSWORD or complete first login interactively.`);
+      }
+    }
+
+    await page.waitForTimeout(1000);
+  }
+}
+
+function adfsHelpMessage(currentUrl) {
+  if (/adfs\.metropolia\.fi/i.test(currentUrl)) {
+    return `ADFS login did not complete. The server may need a saved browser session or MFA/first-login bootstrap. Run once locally with PROMID_HEADLESS=false, complete login, then copy .auth/promid-state.json to the server. Current URL: ${currentUrl}`;
+  }
+  return `Login did not reach the Promid stamping page. Current URL: ${currentUrl}`;
 }
 
 async function findActionLocator(page, action) {
