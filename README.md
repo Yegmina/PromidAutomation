@@ -66,10 +66,15 @@ PROMID_DRY_RUN=false
 PROMID_SCHEDULE=06:00=start,09:00=stop,17:00=start,19:00=lunch,19:30=start,22:30=stop
 PROMID_ACTIVE_DAYS=1,2,3,4,5
 PROMID_TIME_JITTER_MINUTES=10
+PROMID_RETRY_DELAYS_SECONDS=0,60,180,300
 
 PROMID_START_TEXTS=Sisään,Sisaan,Sign in
 PROMID_LUNCH_TEXTS=Lounas,Lunch
 PROMID_STOP_TEXTS=Ulos,Sign out
+
+PROMID_WORKING_STATUS_TEXTS=Signed in,Sisäänkirjautunut
+PROMID_LUNCH_STATUS_TEXTS=Lunch,Lounas
+PROMID_SIGNED_OUT_STATUS_TEXTS=Signed out,Uloskirjautunut
 ```
 
 Important:
@@ -79,6 +84,7 @@ Important:
 - Day numbers are `0=Sunday`, `1=Monday`, `2=Tuesday`, `3=Wednesday`, `4=Thursday`, `5=Friday`, `6=Saturday`.
 - You can also use names like `mon,tue,wed,thu,fri`.
 - `PROMID_TIME_JITTER_MINUTES=10` means each scheduled event runs randomly from 10 minutes before to 10 minutes after the configured time.
+- `PROMID_RETRY_DELAYS_SECONDS=0,60,180,300` means try immediately, then retry after 1, 3, and 5 minutes for transient errors.
 
 ## 3. Run Locally Without Docker
 
@@ -123,6 +129,8 @@ npm start
 ```
 
 The monitor will print the next real scheduled time after jitter. Leave the terminal open.
+
+If a scheduled event fails because Promid is loading, login is temporarily unavailable, the network fails, or the current state is unknown, the monitor retries using `PROMID_RETRY_DELAYS_SECONDS`. Known invalid states are skipped safely instead of retried.
 
 ## 4. Run One Action Manually
 
@@ -215,7 +223,30 @@ PROMID_ACTIVE_DAYS=1,2,3,4,5
 
 Only run Monday-Friday.
 
-## 7. Troubleshooting
+```env
+PROMID_RETRY_DELAYS_SECONDS=0,60,180,300
+```
+
+Retry transient errors now, after 1 minute, after 3 minutes, and after 5 minutes.
+
+```env
+PROMID_WORKING_STATUS_TEXTS=Signed in,Sisäänkirjautunut
+PROMID_LUNCH_STATUS_TEXTS=Lunch,Lounas
+PROMID_SIGNED_OUT_STATUS_TEXTS=Signed out,Uloskirjautunut
+```
+
+Override state-detection text if Promid shows different labels.
+
+## 7. State Safety
+
+The helper checks Promid's current state before every action:
+
+- `start` clicks only from `signed_out` or `lunch`; if already `working`, it skips.
+- `lunch` clicks only from `working`; if already on `lunch`, it skips.
+- `stop` clicks only from `working`; if already `signed_out`, it skips.
+- `unknown` state is retried and never clicked blindly.
+
+## 8. Troubleshooting
 
 If a button is not found, run a dry-run first:
 
@@ -246,7 +277,7 @@ If login keeps failing:
 - Complete MFA if prompted.
 - Delete `.auth` and try again if the saved session is stale.
 
-## 8. Observed Promid Flow
+## 9. Observed Promid Flow
 
 Public login:
 

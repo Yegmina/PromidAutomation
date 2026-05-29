@@ -19,9 +19,13 @@ const config = {
   schedule: env.PROMID_SCHEDULE || '06:00=start,09:00=stop,17:00=start,19:00=lunch,19:30=start,22:30=stop',
   activeDays: parseActiveDays(env.PROMID_ACTIVE_DAYS || '1,2,3,4,5'),
   jitterMinutes: parseNonNegativeInteger(env.PROMID_TIME_JITTER_MINUTES, 0),
+  retryDelaysSeconds: parseNonNegativeIntegerList(env.PROMID_RETRY_DELAYS_SECONDS || '0,60,180,300'),
   startTexts: splitList(env.PROMID_START_TEXTS || 'Sisään,Sisaan,Sign in'),
   lunchTexts: splitList(env.PROMID_LUNCH_TEXTS || 'Lounas,Lunch'),
   stopTexts: splitList(env.PROMID_STOP_TEXTS || 'Ulos,Sign out'),
+  workingStatusTexts: splitList(env.PROMID_WORKING_STATUS_TEXTS || 'Signed in,Sisäänkirjautunut'),
+  lunchStatusTexts: splitList(env.PROMID_LUNCH_STATUS_TEXTS || 'Lunch,Lounas'),
+  signedOutStatusTexts: splitList(env.PROMID_SIGNED_OUT_STATUS_TEXTS || 'Signed out,Uloskirjautunut'),
   startSelector: env.PROMID_START_SELECTOR,
   lunchSelector: env.PROMID_LUNCH_SELECTOR,
   stopSelector: env.PROMID_STOP_SELECTOR
@@ -45,12 +49,7 @@ async function main() {
       throw new Error('Use --once start, --once lunch, or --once stop.');
     }
 
-    const session = await openSession();
-    try {
-      await performAction(session.page, onceAction);
-    } finally {
-      await session.browser.close();
-    }
+    await runActionWithRetries(onceAction);
     return;
   }
 
@@ -68,12 +67,7 @@ async function main() {
     console.log(`Next action: ${next.action.toUpperCase()} at ${formatDateTime(next.at)}${formatJitter(next.jitterMinutes)}.`);
     await sleep(waitMs);
 
-    const session = await openSession();
-    try {
-      await performAction(session.page, next.action);
-    } finally {
-      await session.browser.close();
-    }
+    await runActionWithRetries(next.action);
   }
 }
 
@@ -91,6 +85,9 @@ function validateConfig() {
   if (!config.activeDays.size) {
     throw new Error('PROMID_ACTIVE_DAYS must include at least one day.');
   }
+  if (!config.retryDelaysSeconds.length) {
+    throw new Error('PROMID_RETRY_DELAYS_SECONDS must include at least one delay.');
+  }
 }
 
 async function openSession() {
@@ -101,6 +98,39 @@ async function openSession() {
 
   await ensureLoggedIn(page, context);
   return { browser, context, page };
+}
+
+async function runActionWithRetries(action) {
+  let lastError;
+
+  for (let attempt = 0; attempt < config.retryDelaysSeconds.length; attempt += 1) {
+    const delaySeconds = config.retryDelaysSeconds[attempt];
+    if (delaySeconds > 0) {
+      console.log(`Retrying ${action.toUpperCase()} in ${delaySeconds} seconds.`);
+      await sleep(delaySeconds * 1000);
+    }
+
+    let session;
+    try {
+      console.log(`Running ${action.toUpperCase()} attempt ${attempt + 1}/${config.retryDelaysSeconds.length}.`);
+      session = await openSession();
+      return await performAction(session.page, action);
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableError(error)) {
+        console.log(`Skipped ${action.toUpperCase()}: ${formatError(error)}`);
+        return { status: 'skipped', action };
+      }
+      console.log(`Attempt ${attempt + 1}/${config.retryDelaysSeconds.length} failed: ${formatError(error)}`);
+    } finally {
+      if (session) {
+        await session.browser.close().catch(() => {});
+      }
+    }
+  }
+
+  console.log(`${action.toUpperCase()} failed after ${config.retryDelaysSeconds.length} attempts: ${formatError(lastError)}`);
+  return { status: 'failed', action };
 }
 
 async function ensureLoggedIn(page, context) {
@@ -126,7 +156,13 @@ async function ensureLoggedIn(page, context) {
   }
 
   if (!/promid\.fi/i.test(page.url())) {
-    console.warn(`Login may still be in progress. Current URL: ${page.url()}`);
+    throw retryableError(`Login may still be in progress. Current URL: ${page.url()}`);
+  }
+
+  const stillOnPromidLogin = page.getByRole('button', { name: 'ADFS kirjautuminen' });
+  const stillOnAdfsLogin = page.getByLabel('User Account');
+  if (await isVisible(stillOnPromidLogin) || await isVisible(stillOnAdfsLogin)) {
+    throw retryableError(`Login did not reach the Promid stamping page. Current URL: ${page.url()}`);
   }
 
   await fs.mkdir(path.dirname(config.statePath), { recursive: true });
@@ -137,24 +173,34 @@ async function performAction(page, action) {
   await safeGoto(page, config.url);
   await page.waitForLoadState('networkidle').catch(() => {});
 
+  const state = await detectPromidState(page);
+  console.log(`Promid state: ${state.name} (${state.reason}).`);
+
+  const decision = decideAction(action, state);
+  if (decision.type === 'skip') {
+    console.log(`Skipped ${action.toUpperCase()}: ${decision.reason}`);
+    return { status: 'skipped', action, state: state.name };
+  }
+
   const locator = await findActionLocator(page, action);
 
   if (config.dryRun) {
-    console.log(`[dry-run] Found ${action} control. No click performed.`);
-    return;
+    console.log(`[dry-run] Would click ${action.toUpperCase()} from state ${state.name}. No click performed.`);
+    return { status: 'dry-run', action, state: state.name };
   }
 
   if (config.confirmBeforeAction) {
     const confirmed = await askYesNo(`Confirm ${action.toUpperCase()} in Promid now?`);
     if (!confirmed) {
       console.log(`Skipped ${action}.`);
-      return;
+      return { status: 'skipped', action, state: state.name };
     }
   }
 
   await locator.click();
   await page.waitForLoadState('networkidle').catch(() => {});
   console.log(`${action.toUpperCase()} clicked at ${formatDateTime(new Date())}.`);
+  return { status: 'clicked', action, state: state.name };
 }
 
 async function safeGoto(page, url) {
@@ -169,22 +215,11 @@ async function safeGoto(page, url) {
 }
 
 async function findActionLocator(page, action) {
-  const selector = getActionConfig(action).selector;
-  if (selector) {
-    const locator = page.locator(selector);
-    if (await locator.count()) return locator.first();
-  }
-
-  const texts = getActionConfig(action).texts;
-  for (const text of texts) {
-    for (const role of ['button', 'link', 'menuitem']) {
-      const locator = page.getByRole(role, { name: text, exact: false });
-      if (await locator.count()) return locator.first();
-    }
-  }
+  const locator = await findOptionalActionLocator(page, action);
+  if (locator) return locator;
 
   const visibleControls = await page
-    .locator('button, a, [role="button"], [role="menuitem"]')
+    .locator('button, [role="button"]')
     .evaluateAll((elements) =>
       elements
         .map((element) => element.textContent?.trim())
@@ -196,6 +231,88 @@ async function findActionLocator(page, action) {
     `Could not find ${action} control. Update PROMID_${action.toUpperCase()}_TEXTS or PROMID_${action.toUpperCase()}_SELECTOR.\n` +
     `Visible controls included: ${visibleControls.join(' | ')}`
   );
+}
+
+async function findOptionalActionLocator(page, action) {
+  const selector = getActionConfig(action).selector;
+  if (selector) {
+    const locator = page.locator(selector);
+    if (await locator.count()) return locator.first();
+  }
+
+  const texts = getActionConfig(action).texts;
+  for (const text of texts) {
+    const locator = page.getByRole('button', { name: text, exact: false });
+    if (await locator.count()) return locator.first();
+  }
+
+  return undefined;
+}
+
+async function detectPromidState(page) {
+  const controls = {
+    start: Boolean(await findOptionalActionLocator(page, 'start')),
+    lunch: Boolean(await findOptionalActionLocator(page, 'lunch')),
+    stop: Boolean(await findOptionalActionLocator(page, 'stop'))
+  };
+
+  const pageText = normalizeText(await page.locator('body').innerText({ timeout: 5000 }).catch(() => ''));
+  const matches = {
+    working: textMatchesAny(pageText, config.workingStatusTexts),
+    lunch: textMatchesAny(pageText, config.lunchStatusTexts),
+    signedOut: textMatchesAny(pageText, config.signedOutStatusTexts)
+  };
+
+  if ((matches.working && (controls.lunch || controls.stop)) || (controls.lunch && controls.stop)) {
+    return { name: 'working', controls, reason: 'working status/buttons are visible' };
+  }
+  if (matches.lunch && controls.start) {
+    return { name: 'lunch', controls, reason: 'lunch status and return button are visible' };
+  }
+  if ((matches.signedOut && controls.start && !controls.lunch) || (controls.start && !controls.lunch && !controls.stop)) {
+    return { name: 'signed_out', controls, reason: 'only start button is visible' };
+  }
+  if (matches.working) {
+    return { name: 'working', controls, reason: 'working status text is visible' };
+  }
+  if (matches.lunch) {
+    return { name: 'lunch', controls, reason: 'lunch status text is visible' };
+  }
+  if (matches.signedOut) {
+    return { name: 'signed_out', controls, reason: 'signed-out status text is visible' };
+  }
+
+  return {
+    name: 'unknown',
+    controls,
+    reason: `visible controls start=${controls.start}, lunch=${controls.lunch}, stop=${controls.stop}`
+  };
+}
+
+function decideAction(action, state) {
+  if (state.name === 'unknown') {
+    throw retryableError(`Promid state is unknown; ${action} is not safe.`);
+  }
+
+  const transitions = {
+    start: {
+      working: { type: 'skip', reason: 'already working' },
+      lunch: { type: 'click' },
+      signed_out: { type: 'click' }
+    },
+    lunch: {
+      working: { type: 'click' },
+      lunch: { type: 'skip', reason: 'already on lunch' },
+      signed_out: { type: 'skip', reason: 'cannot start lunch while signed out' }
+    },
+    stop: {
+      working: { type: 'click' },
+      lunch: { type: 'skip', reason: 'currently on lunch; stop is not a valid safe transition' },
+      signed_out: { type: 'skip', reason: 'already signed out' }
+    }
+  };
+
+  return transitions[action][state.name];
 }
 
 function getActionConfig(action) {
@@ -331,6 +448,10 @@ function parseNonNegativeInteger(value, fallback) {
   return parsed;
 }
 
+function parseNonNegativeIntegerList(value) {
+  return splitList(value).map((part) => parseNonNegativeInteger(part, 0));
+}
+
 function parseActiveDays(value) {
   const aliases = {
     sun: 0,
@@ -368,6 +489,28 @@ function formatJitter(jitterMinutes) {
   if (!jitterMinutes) return '';
   const sign = jitterMinutes > 0 ? '+' : '';
   return ` (${sign}${jitterMinutes} min jitter)`;
+}
+
+function retryableError(message) {
+  const error = new Error(message);
+  error.retryable = true;
+  return error;
+}
+
+function isRetryableError(error) {
+  return error?.retryable !== false;
+}
+
+function formatError(error) {
+  return error?.message || String(error);
+}
+
+function normalizeText(value) {
+  return value.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function textMatchesAny(pageText, texts) {
+  return texts.some((text) => pageText.includes(normalizeText(text)));
 }
 
 function formatDateTime(date) {
