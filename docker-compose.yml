@@ -1,0 +1,13 @@
+services:
+  promid-monitor:
+    build: .
+    env_file:
+      - .env
+    environment:
+      PROMID_HEADLESS: "true"
+      PROMID_LOGIN_STATE_PATH: /app/.auth/promid-state.json
+    volumes:
+      - ./.auth:/app/.auth
+    stdin_open: true
+    tty: true
+    restart: unless-stopped

@@ -1,0 +1,16 @@
+{
+  "name": "promid-time-helper",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/promid-monitor.js",
+    "once:start": "node src/promid-monitor.js --once start",
+    "once:lunch": "node src/promid-monitor.js --once lunch",
+    "once:stop": "node src/promid-monitor.js --once stop"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "playwright": "^1.49.1"
+  }
+}
