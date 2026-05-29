@@ -1,8 +1,6 @@
 import 'dotenv/config';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import readline from 'node:readline/promises';
-import { stdin as input, stdout as output } from 'node:process';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { chromium } from 'playwright';
 
@@ -13,9 +11,9 @@ const config = {
   email: env.PROMID_EMAIL,
   password: env.PROMID_PASSWORD,
   headless: parseBoolean(env.PROMID_HEADLESS, false),
-  confirmBeforeAction: parseBoolean(env.PROMID_CONFIRM_BEFORE_ACTION, true),
   dryRun: parseBoolean(env.PROMID_DRY_RUN, false),
   statePath: env.PROMID_LOGIN_STATE_PATH || '.auth/promid-state.json',
+  runtimeStatePath: env.PROMID_RUNTIME_STATE_PATH || '.auth/promid-runtime-state.json',
   schedule: env.PROMID_SCHEDULE || '06:00=start,09:00=stop,17:00=start,19:00=lunch,19:30=start,22:30=stop',
   activeDays: parseActiveDays(env.PROMID_ACTIVE_DAYS || '1,2,3,4,5'),
   jitterMinutes: parseNonNegativeInteger(env.PROMID_TIME_JITTER_MINUTES, 0),
@@ -28,13 +26,24 @@ const config = {
   signedOutStatusTexts: splitList(env.PROMID_SIGNED_OUT_STATUS_TEXTS || 'Signed out,Uloskirjautunut'),
   startSelector: env.PROMID_START_SELECTOR,
   lunchSelector: env.PROMID_LUNCH_SELECTOR,
-  stopSelector: env.PROMID_STOP_SELECTOR
+  stopSelector: env.PROMID_STOP_SELECTOR,
+  telegramToken: env.TELEGRAM_BOT_TOKEN || '',
+  telegramAllowedUsernames: parseUsernames(env.TELEGRAM_ALLOWED_USERNAMES || 'yehorte,yehortere,yehor_a'),
+  telegramStatePath: env.TELEGRAM_STATE_PATH || '.auth/telegram-state.json',
+  telegramDryRun: parseBoolean(env.TELEGRAM_DRY_RUN, false)
 };
 
 const args = process.argv.slice(2);
 const onceIndex = args.indexOf('--once');
 const onceAction = onceIndex >= 0 ? args[onceIndex + 1] : undefined;
 const jitterOffsets = new Map();
+
+let runtimeState = defaultRuntimeState();
+let telegramState = defaultTelegramState();
+let monitorWake;
+let lastNextNoticeKey;
+let actionQueue = Promise.resolve();
+let actionQueueDepth = 0;
 
 main().catch((error) => {
   console.error(error);
@@ -43,32 +52,32 @@ main().catch((error) => {
 
 async function main() {
   validateConfig();
+  runtimeState = await loadRuntimeState();
+  telegramState = await loadTelegramState();
 
   if (onceAction) {
     if (!['start', 'lunch', 'stop'].includes(onceAction)) {
       throw new Error('Use --once start, --once lunch, or --once stop.');
     }
 
-    await runActionWithRetries(onceAction);
+    await runExclusive(`once:${onceAction}`, () => runActionWithRetries(onceAction, {
+      trigger: 'manual',
+      source: 'cli'
+    })).promise;
     return;
   }
 
-  console.log(`Promid monitor started at ${formatDateTime(new Date())}.`);
-  console.log(`Configured schedule: ${config.schedule}`);
-  console.log(`Active days: ${formatActiveDays(config.activeDays)}.`);
+  await emit(`Promid monitor started.
+Schedule: ${getActiveSchedule()}
+Active days: ${formatActiveDays(config.activeDays)}
+Automation: ${runtimeState.automationEnabled ? 'on' : 'off'}
+Telegram: ${telegramModeLabel()}`);
   if (config.jitterMinutes > 0) {
-    console.log(`Time jitter: +/- ${config.jitterMinutes} minutes.`);
+    await emit(`Time jitter: +/- ${config.jitterMinutes} minutes.`);
   }
 
-  const events = parseSchedule(config.schedule);
-  while (true) {
-    const next = getNextAction(new Date(), events);
-    const waitMs = Math.max(0, next.at.getTime() - Date.now());
-    console.log(`Next action: ${next.action.toUpperCase()} at ${formatDateTime(next.at)}${formatJitter(next.jitterMinutes)}.`);
-    await sleep(waitMs);
-
-    await runActionWithRetries(next.action);
-  }
+  void runTelegramPoller();
+  await runMonitorLoop();
 }
 
 function validateConfig() {
@@ -90,6 +99,52 @@ function validateConfig() {
   }
 }
 
+async function runMonitorLoop() {
+  while (true) {
+    const events = getActiveEvents();
+    const next = getNextAction(new Date(), events);
+    const nextKey = eventKey(next);
+    if (nextKey !== lastNextNoticeKey) {
+      lastNextNoticeKey = nextKey;
+      await emit(`Next automatic action: ${next.action.toUpperCase()} at ${formatDateTime(next.at)}${formatJitter(next.jitterMinutes)}.`);
+    }
+
+    const waitResult = await waitUntil(next.at);
+    if (waitResult === 'woken') {
+      continue;
+    }
+
+    if (!runtimeState.automationEnabled) {
+      const result = {
+        status: 'skipped',
+        action: next.action,
+        reason: 'automation is turned off',
+        previousState: 'unknown',
+        finalState: 'unknown',
+        attempts: 0
+      };
+      await emit(`Skipped automatic ${next.action.toUpperCase()}: automation is turned off.`);
+      await recordAction(result, autoContext(next));
+      await maybeSendDailyReport(next, events);
+      continue;
+    }
+
+    const queued = runExclusive(`auto:${next.action}`, () => runActionWithRetries(next.action, autoContext(next)));
+    await queued.promise;
+    await maybeSendDailyReport(next, events);
+  }
+}
+
+function autoContext(next) {
+  return {
+    trigger: 'auto',
+    source: 'schedule',
+    scheduledAt: next.at,
+    baseAt: next.baseAt,
+    jitterMinutes: next.jitterMinutes
+  };
+}
+
 async function openSession() {
   const storageState = await fileExists(config.statePath) ? config.statePath : undefined;
   const browser = await chromium.launch({ headless: config.headless });
@@ -100,28 +155,41 @@ async function openSession() {
   return { browser, context, page };
 }
 
-async function runActionWithRetries(action) {
+async function runActionWithRetries(action, context = {}) {
   let lastError;
+  let lastResult;
 
   for (let attempt = 0; attempt < config.retryDelaysSeconds.length; attempt += 1) {
     const delaySeconds = config.retryDelaysSeconds[attempt];
     if (delaySeconds > 0) {
-      console.log(`Retrying ${action.toUpperCase()} in ${delaySeconds} seconds.`);
+      await emit(`Retrying ${action.toUpperCase()} in ${delaySeconds} seconds.`);
       await sleep(delaySeconds * 1000);
     }
 
     let session;
     try {
-      console.log(`Running ${action.toUpperCase()} attempt ${attempt + 1}/${config.retryDelaysSeconds.length}.`);
+      await emit(`Running ${action.toUpperCase()} attempt ${attempt + 1}/${config.retryDelaysSeconds.length} (${context.trigger || 'manual'}).`);
       session = await openSession();
-      return await performAction(session.page, action);
+      lastResult = await performAction(session.page, action, attempt + 1);
+      await recordAction(lastResult, context);
+      await emit(formatActionResult(lastResult));
+      return lastResult;
     } catch (error) {
       lastError = error;
       if (!isRetryableError(error)) {
-        console.log(`Skipped ${action.toUpperCase()}: ${formatError(error)}`);
-        return { status: 'skipped', action };
+        lastResult = {
+          status: 'skipped',
+          action,
+          reason: formatError(error),
+          previousState: 'unknown',
+          finalState: 'unknown',
+          attempts: attempt + 1
+        };
+        await recordAction(lastResult, context);
+        await emit(formatActionResult(lastResult));
+        return lastResult;
       }
-      console.log(`Attempt ${attempt + 1}/${config.retryDelaysSeconds.length} failed: ${formatError(error)}`);
+      await emit(`Attempt ${attempt + 1}/${config.retryDelaysSeconds.length} failed: ${formatError(error)}`);
     } finally {
       if (session) {
         await session.browser.close().catch(() => {});
@@ -129,8 +197,17 @@ async function runActionWithRetries(action) {
     }
   }
 
-  console.log(`${action.toUpperCase()} failed after ${config.retryDelaysSeconds.length} attempts: ${formatError(lastError)}`);
-  return { status: 'failed', action };
+  lastResult = {
+    status: 'failed',
+    action,
+    reason: formatError(lastError),
+    previousState: 'unknown',
+    finalState: 'unknown',
+    attempts: config.retryDelaysSeconds.length
+  };
+  await recordAction(lastResult, context);
+  await emit(formatActionResult(lastResult));
+  return lastResult;
 }
 
 async function ensureLoggedIn(page, context) {
@@ -150,7 +227,7 @@ async function ensureLoggedIn(page, context) {
     await page.getByRole('button', { name: 'Sign in' }).click();
     await page.waitForLoadState('domcontentloaded');
 
-    console.log('If your organization requires MFA, complete it in the browser window.');
+    await emit('If your organization requires MFA, complete it in the browser window.');
     await page.waitForURL(/promid\.fi/i, { timeout: 120_000 }).catch(() => {});
     await page.waitForLoadState('domcontentloaded').catch(() => {});
   }
@@ -169,38 +246,61 @@ async function ensureLoggedIn(page, context) {
   await context.storageState({ path: config.statePath });
 }
 
-async function performAction(page, action) {
+async function performAction(page, action, attempts) {
   await safeGoto(page, config.url);
   await page.waitForLoadState('networkidle').catch(() => {});
 
   const state = await detectPromidState(page);
-  console.log(`Promid state: ${state.name} (${state.reason}).`);
-
   const decision = decideAction(action, state);
   if (decision.type === 'skip') {
-    console.log(`Skipped ${action.toUpperCase()}: ${decision.reason}`);
-    return { status: 'skipped', action, state: state.name };
+    return {
+      status: 'skipped',
+      action,
+      reason: decision.reason,
+      previousState: state.name,
+      finalState: state.name,
+      attempts
+    };
   }
 
   const locator = await findActionLocator(page, action);
 
   if (config.dryRun) {
-    console.log(`[dry-run] Would click ${action.toUpperCase()} from state ${state.name}. No click performed.`);
-    return { status: 'dry-run', action, state: state.name };
-  }
-
-  if (config.confirmBeforeAction) {
-    const confirmed = await askYesNo(`Confirm ${action.toUpperCase()} in Promid now?`);
-    if (!confirmed) {
-      console.log(`Skipped ${action}.`);
-      return { status: 'skipped', action, state: state.name };
-    }
+    return {
+      status: 'dry-run',
+      action,
+      reason: 'dry-run mode, no click performed',
+      previousState: state.name,
+      finalState: state.name,
+      attempts
+    };
   }
 
   await locator.click();
   await page.waitForLoadState('networkidle').catch(() => {});
-  console.log(`${action.toUpperCase()} clicked at ${formatDateTime(new Date())}.`);
-  return { status: 'clicked', action, state: state.name };
+  const finalState = await detectPromidState(page);
+  return {
+    status: 'clicked',
+    action,
+    reason: 'button clicked',
+    previousState: state.name,
+    finalState: finalState.name,
+    attempts
+  };
+}
+
+async function inspectPromidState() {
+  let session;
+  try {
+    session = await openSession();
+    await safeGoto(session.page, config.url);
+    await session.page.waitForLoadState('networkidle').catch(() => {});
+    return await detectPromidState(session.page);
+  } finally {
+    if (session) {
+      await session.browser.close().catch(() => {});
+    }
+  }
 }
 
 async function safeGoto(page, url) {
@@ -315,6 +415,448 @@ function decideAction(action, state) {
   return transitions[action][state.name];
 }
 
+function runExclusive(label, task) {
+  const queued = actionQueueDepth > 0;
+  actionQueueDepth += 1;
+  const promise = actionQueue
+    .catch(() => {})
+    .then(async () => {
+      if (queued) {
+        await emit(`${label} queued until the current browser action finishes.`);
+      }
+      return task();
+    })
+    .finally(() => {
+      actionQueueDepth -= 1;
+    });
+  actionQueue = promise.catch(() => {});
+  return { queued, promise };
+}
+
+async function runTelegramPoller() {
+  if (!config.telegramToken && !config.telegramDryRun) {
+    console.log('Telegram disabled: TELEGRAM_BOT_TOKEN is not set.');
+    return;
+  }
+  if (config.telegramDryRun) {
+    console.log('Telegram dry-run enabled: outgoing messages are logged, not sent.');
+  }
+  if (!config.telegramToken) {
+    return;
+  }
+
+  while (true) {
+    try {
+      const updates = await telegramApi('getUpdates', {
+        offset: telegramState.offset,
+        timeout: 30,
+        allowed_updates: ['message']
+      });
+
+      for (const update of updates) {
+        await handleTelegramUpdate(update);
+        telegramState.offset = update.update_id + 1;
+        await saveTelegramState();
+      }
+    } catch (error) {
+      console.log(`Telegram polling error: ${formatError(error)}`);
+      await sleep(5000);
+    }
+  }
+}
+
+async function handleTelegramUpdate(update) {
+  const message = update.message;
+  if (!message?.chat?.id || !message.from) return;
+
+  const username = normalizeUsername(message.from.username || '');
+  if (!config.telegramAllowedUsernames.has(username)) {
+    console.log(`Ignored Telegram message from unauthorized user: ${username || 'unknown'}`);
+    return;
+  }
+
+  registerTelegramChat(message.chat.id, username);
+  await saveTelegramState();
+
+  const text = (message.text || '').trim();
+  if (!text.startsWith('/')) {
+    await sendTelegramMessage(message.chat.id, commandHelp());
+    return;
+  }
+
+  const firstSpace = text.indexOf(' ');
+  const commandText = firstSpace === -1 ? text : text.slice(0, firstSpace);
+  const command = commandText.split('@')[0].toLowerCase();
+  const commandArgs = firstSpace === -1 ? '' : text.slice(firstSpace + 1).trim();
+
+  await handleTelegramCommand(message.chat.id, username, command, commandArgs);
+}
+
+async function handleTelegramCommand(chatId, username, command, argsText) {
+  switch (command) {
+    case '/start':
+    case '/help':
+      await sendTelegramMessage(chatId, commandHelp());
+      return;
+    case '/status':
+      await handleStatusCommand(chatId);
+      return;
+    case '/startwork':
+      await handleManualActionCommand(chatId, username, 'start');
+      return;
+    case '/lunch':
+      await handleManualActionCommand(chatId, username, 'lunch');
+      return;
+    case '/stopwork':
+      await handleManualActionCommand(chatId, username, 'stop');
+      return;
+    case '/turnon':
+      runtimeState.automationEnabled = true;
+      await saveRuntimeState();
+      wakeMonitorLoop();
+      await emit(`Automatic schedule turned ON by @${username}.`);
+      return;
+    case '/turnoff':
+      runtimeState.automationEnabled = false;
+      await saveRuntimeState();
+      wakeMonitorLoop();
+      await emit(`Automatic schedule turned OFF by @${username}.`);
+      return;
+    case '/schedule':
+      await sendTelegramMessage(chatId, `Active schedule: ${getActiveSchedule()}\nSource: ${runtimeState.scheduleOverride ? 'Telegram override' : '.env'}`);
+      return;
+    case '/setschedule':
+      await handleSetScheduleCommand(chatId, username, argsText);
+      return;
+    case '/resetschedule':
+      runtimeState.scheduleOverride = null;
+      await saveRuntimeState();
+      jitterOffsets.clear();
+      wakeMonitorLoop();
+      await emit(`Schedule reset to .env by @${username}. Active schedule: ${getActiveSchedule()}`);
+      return;
+    case '/report':
+      await sendTelegramMessage(chatId, buildDailyReport(dateKey(new Date()), false));
+      return;
+    default:
+      await sendTelegramMessage(chatId, `Unknown command: ${command}\n\n${commandHelp()}`);
+  }
+}
+
+async function handleStatusCommand(chatId) {
+  const next = getNextAction(new Date(), getActiveEvents());
+  const statusLines = [
+    `Automation: ${runtimeState.automationEnabled ? 'on' : 'off'}`,
+    `Dry-run: ${config.dryRun ? 'on' : 'off'}`,
+    `Schedule: ${getActiveSchedule()}`,
+    `Next event: ${next.action.toUpperCase()} at ${formatDateTime(next.at)}${formatJitter(next.jitterMinutes)}`
+  ];
+
+  const stateCheck = runExclusive('status', inspectPromidState);
+  if (stateCheck.queued) {
+    statusLines.push('Promid state: queued behind current action');
+  }
+
+  try {
+    const state = await stateCheck.promise;
+    statusLines.push(`Promid state: ${state.name} (${state.reason})`);
+  } catch (error) {
+    statusLines.push(`Promid state: unavailable (${formatError(error)})`);
+  }
+
+  await sendTelegramMessage(chatId, statusLines.join('\n'));
+}
+
+async function handleManualActionCommand(chatId, username, action) {
+  await sendTelegramMessage(chatId, `Accepted ${action.toUpperCase()} command from @${username}.`);
+  const queued = runExclusive(`telegram:${action}`, () => runActionWithRetries(action, {
+    trigger: 'telegram',
+    source: `@${username}`
+  }));
+  if (queued.queued) {
+    await sendTelegramMessage(chatId, `${action.toUpperCase()} is queued behind another browser action.`);
+  }
+  void queued.promise.catch((error) => emit(`Telegram ${action} command failed: ${formatError(error)}`));
+}
+
+async function handleSetScheduleCommand(chatId, username, argsText) {
+  if (!argsText) {
+    await sendTelegramMessage(chatId, 'Usage: /setschedule 06:00=start,09:00=stop,17:00=start');
+    return;
+  }
+
+  try {
+    parseSchedule(argsText);
+  } catch (error) {
+    await sendTelegramMessage(chatId, `Invalid schedule: ${formatError(error)}`);
+    return;
+  }
+
+  runtimeState.scheduleOverride = argsText;
+  await saveRuntimeState();
+  jitterOffsets.clear();
+  wakeMonitorLoop();
+  await emit(`Schedule override set by @${username}: ${argsText}`);
+}
+
+function commandHelp() {
+  return [
+    'Promid Manager commands:',
+    '/status - show automation, schedule, next event, and Promid state',
+    '/startwork - run safe start action now',
+    '/lunch - run safe lunch action now',
+    '/stopwork - run safe stop action now',
+    '/turnon - enable automatic schedule',
+    '/turnoff - disable automatic schedule',
+    '/schedule - show active schedule',
+    '/setschedule 06:00=start,09:00=stop - override runtime schedule',
+    '/resetschedule - use .env schedule again',
+    '/report - send today report'
+  ].join('\n');
+}
+
+async function telegramApi(method, payload) {
+  const response = await fetch(`https://api.telegram.org/bot${config.telegramToken}/${method}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  const body = await response.json().catch(() => undefined);
+  if (!response.ok || !body?.ok) {
+    throw new Error(body?.description || `Telegram ${method} failed with HTTP ${response.status}`);
+  }
+  return body.result;
+}
+
+async function sendTelegramToAll(text) {
+  const chats = telegramState.chats.filter((chat) => chat.authorized);
+  if (config.telegramDryRun) {
+    console.log(`[telegram dry-run] ${text}`);
+    return;
+  }
+  if (!config.telegramToken || chats.length === 0) return;
+
+  for (const chat of chats) {
+    await sendTelegramMessage(chat.id, text);
+  }
+}
+
+async function sendTelegramMessage(chatId, text) {
+  if (config.telegramDryRun) {
+    console.log(`[telegram dry-run -> ${chatId}] ${text}`);
+    return;
+  }
+  if (!config.telegramToken) return;
+
+  for (const chunk of chunkText(text, 3900)) {
+    await telegramApi('sendMessage', {
+      chat_id: chatId,
+      text: chunk,
+      disable_web_page_preview: true
+    });
+  }
+}
+
+async function emit(text) {
+  console.log(text);
+  await sendTelegramToAll(text).catch((error) => {
+    console.log(`Telegram send failed: ${formatError(error)}`);
+  });
+}
+
+function registerTelegramChat(chatId, username) {
+  const existing = telegramState.chats.find((chat) => chat.id === chatId);
+  if (existing) {
+    existing.username = username;
+    existing.authorized = true;
+    existing.lastSeenAt = new Date().toISOString();
+    return;
+  }
+
+  telegramState.chats.push({
+    id: chatId,
+    username,
+    authorized: true,
+    firstSeenAt: new Date().toISOString(),
+    lastSeenAt: new Date().toISOString()
+  });
+}
+
+async function recordAction(result, context = {}) {
+  const at = new Date();
+  const reportDate = context.baseAt ? dateKey(new Date(context.baseAt)) : dateKey(at);
+  const day = ensureRuntimeDay(reportDate);
+  day.events.push({
+    at: at.toISOString(),
+    trigger: context.trigger || 'manual',
+    source: context.source || 'unknown',
+    scheduledAt: context.scheduledAt ? new Date(context.scheduledAt).toISOString() : null,
+    baseAt: context.baseAt ? new Date(context.baseAt).toISOString() : null,
+    jitterMinutes: context.jitterMinutes ?? null,
+    action: result.action,
+    status: result.status,
+    reason: result.reason || null,
+    previousState: result.previousState || null,
+    finalState: result.finalState || null,
+    attempts: result.attempts || 0
+  });
+  await saveRuntimeState();
+}
+
+async function maybeSendDailyReport(next, events) {
+  if (!isLastEventOfDay(next, events)) return;
+
+  const reportDate = dateKey(next.baseAt);
+  const day = ensureRuntimeDay(reportDate);
+  if (day.reported) return;
+
+  await emit(buildDailyReport(reportDate, true));
+  day.reported = true;
+  day.reportedAt = new Date().toISOString();
+  await saveRuntimeState();
+}
+
+function buildDailyReport(reportDate, finalReport) {
+  const day = ensureRuntimeDay(reportDate);
+  const title = finalReport ? 'End-of-day Promid report' : 'Promid report so far';
+  const events = day.events || [];
+  const duration = calculateObservedWorkDuration(events);
+  const lines = [
+    `${title} (${reportDate})`,
+    `Events: ${events.length}`,
+    `Bot-observed working time: ${formatDuration(duration.ms)}${duration.partial ? ' (partial)' : ''}`
+  ];
+
+  if (!events.length) {
+    lines.push('No bot-observed events yet.');
+    return lines.join('\n');
+  }
+
+  for (const event of events.slice(-30)) {
+    const at = formatTimeOnly(new Date(event.at));
+    lines.push(`${at} ${event.trigger} ${String(event.action).toUpperCase()} -> ${event.status} (${event.previousState || '?'} -> ${event.finalState || '?'})${event.reason ? `: ${event.reason}` : ''}`);
+  }
+
+  if (events.length > 30) {
+    lines.push(`... ${events.length - 30} older events omitted.`);
+  }
+  if (duration.partial) {
+    lines.push('Note: total is partial because the bot started mid-day, missed transitions, dry-run was used, or an interval is still open.');
+  }
+  return lines.join('\n');
+}
+
+function calculateObservedWorkDuration(events) {
+  let startedAt;
+  let totalMs = 0;
+  let partial = false;
+
+  for (const event of events) {
+    if (event.status !== 'clicked') {
+      if (['failed', 'dry-run'].includes(event.status)) partial = true;
+      continue;
+    }
+
+    const at = new Date(event.at);
+    if (event.action === 'start') {
+      if (startedAt) partial = true;
+      startedAt = at;
+    } else if (['lunch', 'stop'].includes(event.action)) {
+      if (!startedAt) {
+        partial = true;
+      } else {
+        totalMs += Math.max(0, at.getTime() - startedAt.getTime());
+        startedAt = undefined;
+      }
+    }
+  }
+
+  if (startedAt) partial = true;
+  return { ms: totalMs, partial };
+}
+
+function isLastEventOfDay(next, events) {
+  const sameDayEvents = events
+    .map((event) => ({ event, at: dateAt(next.baseAt, 0, event.time) }))
+    .filter((candidate) => dateKey(candidate.at) === dateKey(next.baseAt))
+    .sort((a, b) => a.at.getTime() - b.at.getTime());
+
+  const last = sameDayEvents.at(-1);
+  return Boolean(last && last.event.action === next.action && sameClockTime(last.at, next.baseAt));
+}
+
+function sameClockTime(a, b) {
+  return a.getHours() === b.getHours() && a.getMinutes() === b.getMinutes();
+}
+
+function defaultRuntimeState() {
+  return {
+    automationEnabled: true,
+    scheduleOverride: null,
+    days: {}
+  };
+}
+
+function defaultTelegramState() {
+  return {
+    offset: 0,
+    chats: []
+  };
+}
+
+async function loadRuntimeState() {
+  const loaded = await loadJson(config.runtimeStatePath, defaultRuntimeState());
+  return {
+    automationEnabled: loaded.automationEnabled !== false,
+    scheduleOverride: typeof loaded.scheduleOverride === 'string' && loaded.scheduleOverride ? loaded.scheduleOverride : null,
+    days: loaded.days && typeof loaded.days === 'object' ? loaded.days : {}
+  };
+}
+
+async function saveRuntimeState() {
+  await saveJson(config.runtimeStatePath, runtimeState);
+}
+
+async function loadTelegramState() {
+  const loaded = await loadJson(config.telegramStatePath, defaultTelegramState());
+  return {
+    offset: Number.isInteger(loaded.offset) ? loaded.offset : 0,
+    chats: Array.isArray(loaded.chats) ? loaded.chats : []
+  };
+}
+
+async function saveTelegramState() {
+  await saveJson(config.telegramStatePath, telegramState);
+}
+
+function ensureRuntimeDay(reportDate) {
+  runtimeState.days ||= {};
+  runtimeState.days[reportDate] ||= { events: [], reported: false };
+  runtimeState.days[reportDate].events ||= [];
+  return runtimeState.days[reportDate];
+}
+
+async function loadJson(file, fallback) {
+  try {
+    return JSON.parse(await fs.readFile(file, 'utf8'));
+  } catch {
+    return fallback;
+  }
+}
+
+async function saveJson(file, data) {
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+}
+
+function getActiveSchedule() {
+  return runtimeState.scheduleOverride || config.schedule;
+}
+
+function getActiveEvents() {
+  return parseSchedule(getActiveSchedule());
+}
+
 function getActionConfig(action) {
   const actionConfig = {
     start: { selector: config.startSelector, texts: config.startTexts },
@@ -382,6 +924,22 @@ function getJitterMinutes(baseAt, event) {
   return jitterOffsets.get(key);
 }
 
+function waitUntil(date) {
+  const waitMs = Math.max(0, date.getTime() - Date.now());
+  return Promise.race([
+    sleep(waitMs).then(() => 'due'),
+    new Promise((resolve) => {
+      monitorWake = () => resolve('woken');
+    })
+  ]).finally(() => {
+    monitorWake = undefined;
+  });
+}
+
+function wakeMonitorLoop() {
+  if (monitorWake) monitorWake();
+}
+
 function dateAt(base, dayOffset, time) {
   const date = new Date(base);
   date.setDate(date.getDate() + dayOffset);
@@ -394,22 +952,16 @@ function addMinutes(date, minutes) {
 }
 
 function dateKey(date) {
-  return `${date.getFullYear()}-${date.getMonth() + 1}-${date.getDate()}`;
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+}
+
+function eventKey(event) {
+  return `${event.action}|${event.at.toISOString()}|${event.baseAt.toISOString()}`;
 }
 
 function validateTime(hour, minute, source) {
   if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
     throw new Error(`Invalid time in ${source}.`);
-  }
-}
-
-async function askYesNo(question) {
-  const rl = readline.createInterface({ input, output });
-  try {
-    const answer = await rl.question(`${question} [y/N] `);
-    return ['y', 'yes'].includes(answer.trim().toLowerCase());
-  } finally {
-    rl.close();
   }
 }
 
@@ -480,6 +1032,18 @@ function parseActiveDays(value) {
   }));
 }
 
+function parseUsernames(value) {
+  return new Set(splitList(value).map(normalizeUsername).filter(Boolean));
+}
+
+function normalizeUsername(value) {
+  return value
+    .replace(/^https:\/\/t\.me\//i, '')
+    .replace(/^@/, '')
+    .trim()
+    .toLowerCase();
+}
+
 function formatActiveDays(activeDays) {
   const names = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   return [...activeDays].sort((a, b) => a - b).map((day) => names[day]).join(', ');
@@ -489,6 +1053,11 @@ function formatJitter(jitterMinutes) {
   if (!jitterMinutes) return '';
   const sign = jitterMinutes > 0 ? '+' : '';
   return ` (${sign}${jitterMinutes} min jitter)`;
+}
+
+function formatActionResult(result) {
+  const stateText = `${result.previousState || '?'} -> ${result.finalState || '?'}`;
+  return `${String(result.action).toUpperCase()} ${result.status}: ${stateText}; attempts=${result.attempts || 0}; ${result.reason || 'done'}`;
 }
 
 function retryableError(message) {
@@ -518,4 +1087,35 @@ function formatDateTime(date) {
     dateStyle: 'short',
     timeStyle: 'medium'
   }).format(date);
+}
+
+function formatTimeOnly(date) {
+  return new Intl.DateTimeFormat(undefined, {
+    timeStyle: 'short'
+  }).format(date);
+}
+
+function formatDuration(ms) {
+  const totalMinutes = Math.round(ms / 60_000);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return `${hours}h ${pad2(minutes)}m`;
+}
+
+function telegramModeLabel() {
+  if (config.telegramDryRun) return 'dry-run';
+  if (config.telegramToken) return 'enabled';
+  return 'disabled';
+}
+
+function chunkText(text, size) {
+  const chunks = [];
+  for (let index = 0; index < text.length; index += size) {
+    chunks.push(text.slice(index, index + size));
+  }
+  return chunks.length ? chunks : [''];
+}
+
+function pad2(value) {
+  return String(value).padStart(2, '0');
 }
