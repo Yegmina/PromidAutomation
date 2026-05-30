@@ -4,7 +4,7 @@ Supervised Promid stamping helper for Metropolia Promid.
 
 It opens `https://metropolia.promid.fi/`, clicks `ADFS kirjautuminen`, logs in with credentials from `.env`, waits for scheduled work events, skips non-workdays, applies optional random time jitter, and clicks the configured Promid button when the event is due.
 
-It never clicks blindly: every action checks the current Promid state first. Telegram commands can report status, control the automatic schedule, override the schedule at runtime, and run state-safe manual actions.
+It never clicks blindly: every action checks the current Promid state first. Telegram can report status, control the automatic schedule, edit different Monday-Friday schedules with buttons, and run state-safe manual actions.
 
 ## What The Actions Mean
 
@@ -286,12 +286,31 @@ TELEGRAM_DRY_RUN=false
 
 Enable Telegram reports and commands. The bot registers chat IDs only after an allowed username messages it.
 
-## 7. Telegram Commands
+## 7. Telegram Buttons
 
-Message the bot from an allowed Telegram username, then use:
+Message `/start` to the bot from an allowed Telegram username. The normal control flow is button-based:
+
+- `Status` shows automation, today's effective schedule, the next event, and Promid state.
+- `Start Work`, `Lunch`, and `Stop Work` run the same safe state checks as scheduled actions.
+- `Turn Auto On/Off` enables or disables automatic scheduled actions.
+- `Schedule` opens the weekly editor.
+- `Report` sends today's bot-observed report.
+
+In `Schedule`, use:
+
+- `View Week` to see Monday-Friday effective schedules.
+- `Edit Monday` through `Edit Friday` to customize one workday.
+- `Add Event` to choose action, hour, and minute in 5-minute steps.
+- `Delete Event` to remove one event from that day.
+- `Copy From Monday` to reuse Monday's effective schedule on another weekday.
+- `Clear Day` to make that weekday have no automatic events.
+- `Reset Week Override` to remove all weekday custom schedules and return Monday-Friday to the fallback schedule.
+
+Weekends are not shown in the Telegram editor and are rejected if someone crafts a weekend callback manually. Runtime schedule overrides are stored in `.auth/promid-runtime-state.json`; `.env` is not edited by Telegram.
+
+Hidden typed shortcuts still work for emergencies:
 
 ```text
-/start
 /status
 /startwork
 /lunch
@@ -299,12 +318,13 @@ Message the bot from an allowed Telegram username, then use:
 /turnon
 /turnoff
 /schedule
-/setschedule 06:00=start,09:00=stop,17:00=start
-/resetschedule
 /report
+/setschedule 06:00=start,09:00=stop,17:00=start
+/setdayschedule mon 06:00=start,09:00=stop
+/cleardayschedule mon
+/resetschedule
+/resetweekschedule
 ```
-
-Runtime schedule overrides are stored in `.auth/promid-runtime-state.json`; `.env` is not edited by Telegram commands.
 
 ## 8. State Safety
 
@@ -314,7 +334,7 @@ The helper checks Promid's current state before every action:
 - `lunch` clicks only from `working`; if already on `lunch`, it skips.
 - `stop` clicks only from `working`; if already `signed_out`, it skips.
 - `unknown` state is retried and never clicked blindly.
-- Telegram `/startwork`, `/lunch`, and `/stopwork` use the same state-safe logic.
+- Telegram buttons and typed `/startwork`, `/lunch`, and `/stopwork` use the same state-safe logic.
 - At the end of the last scheduled event of an active day, the bot sends a daily report with observed actions and bot-observed working time.
 
 ## 9. Troubleshooting
@@ -323,6 +343,12 @@ If a button is not found, run a dry-run first:
 
 ```bash
 PROMID_DRY_RUN=true npm run once:lunch
+```
+
+Check the Telegram button scheduler logic without opening a browser:
+
+```bash
+npm run test:telegram-ui
 ```
 
 Then update one of these in `.env`:

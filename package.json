@@ -8,7 +8,8 @@
     "bootstrap:session": "node src/promid-monitor.js --bootstrap-session",
     "once:start": "node src/promid-monitor.js --once start",
     "once:lunch": "node src/promid-monitor.js --once lunch",
-    "once:stop": "node src/promid-monitor.js --once stop"
+    "once:stop": "node src/promid-monitor.js --once stop",
+    "test:telegram-ui": "node src/promid-monitor.js --telegram-ui-self-test"
   },
   "dependencies": {
     "dotenv": "^16.4.7",

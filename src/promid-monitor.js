@@ -37,7 +37,26 @@ const args = process.argv.slice(2);
 const onceIndex = args.indexOf('--once');
 const onceAction = onceIndex >= 0 ? args[onceIndex + 1] : undefined;
 const bootstrapSession = args.includes('--bootstrap-session');
+const telegramUiSelfTest = args.includes('--telegram-ui-self-test');
 const jitterOffsets = new Map();
+const WORKDAY_KEYS = ['mon', 'tue', 'wed', 'thu', 'fri'];
+const WORKDAY_LABELS = {
+  mon: 'Monday',
+  tue: 'Tuesday',
+  wed: 'Wednesday',
+  thu: 'Thursday',
+  fri: 'Friday'
+};
+const WORKDAY_TO_DAY_NUMBER = {
+  mon: 1,
+  tue: 2,
+  wed: 3,
+  thu: 4,
+  fri: 5
+};
+const DAY_NUMBER_TO_WORKDAY = Object.fromEntries(
+  Object.entries(WORKDAY_TO_DAY_NUMBER).map(([key, value]) => [value, key])
+);
 
 let runtimeState = defaultRuntimeState();
 let telegramState = defaultTelegramState();
@@ -52,6 +71,11 @@ main().catch((error) => {
 });
 
 async function main() {
+  if (telegramUiSelfTest) {
+    runTelegramUiSelfTest();
+    return;
+  }
+
   validateConfig();
   runtimeState = await loadRuntimeState();
   telegramState = await loadTelegramState();
@@ -74,7 +98,7 @@ async function main() {
   }
 
   await emit(`Promid monitor started.
-Schedule: ${getActiveSchedule()}
+Fallback schedule: ${getFallbackSchedule()}
 Active days: ${formatActiveDays(config.activeDays)}
 Automation: ${runtimeState.automationEnabled ? 'on' : 'off'}
 Telegram: ${telegramModeLabel()}`);
@@ -100,6 +124,9 @@ function validateConfig() {
   if (!config.activeDays.size) {
     throw new Error('PROMID_ACTIVE_DAYS must include at least one day.');
   }
+  if (![...config.activeDays].some((day) => day >= 1 && day <= 5)) {
+    throw new Error('PROMID_ACTIVE_DAYS must include at least one weekday; weekends stay disabled.');
+  }
   if (!config.retryDelaysSeconds.length) {
     throw new Error('PROMID_RETRY_DELAYS_SECONDS must include at least one delay.');
   }
@@ -107,12 +134,18 @@ function validateConfig() {
 
 async function runMonitorLoop() {
   while (true) {
-    const events = getActiveEvents();
-    const next = getNextAction(new Date(), events);
-    const nextKey = eventKey(next);
+    const next = getNextAction(new Date());
+    const nextKey = next ? eventKey(next) : 'none';
     if (nextKey !== lastNextNoticeKey) {
       lastNextNoticeKey = nextKey;
-      await emit(`Next automatic action: ${next.action.toUpperCase()} at ${formatDateTime(next.at)}${formatJitter(next.jitterMinutes)}.`);
+      await emit(next
+        ? `Next automatic action: ${next.action.toUpperCase()} at ${formatDateTime(next.at)}${formatJitter(next.jitterMinutes)}.`
+        : 'No upcoming automatic actions found for the active weekdays.');
+    }
+
+    if (!next) {
+      await waitUntil(addMinutes(new Date(), 60));
+      continue;
     }
 
     const waitResult = await waitUntil(next.at);
@@ -131,13 +164,13 @@ async function runMonitorLoop() {
       };
       await emit(`Skipped automatic ${next.action.toUpperCase()}: automation is turned off.`);
       await recordAction(result, autoContext(next));
-      await maybeSendDailyReport(next, events);
+      await maybeSendDailyReport(next);
       continue;
     }
 
     const queued = runExclusive(`auto:${next.action}`, () => runActionWithRetries(next.action, autoContext(next)));
     await queued.promise;
-    await maybeSendDailyReport(next, events);
+    await maybeSendDailyReport(next);
   }
 }
 
@@ -147,7 +180,9 @@ function autoContext(next) {
     source: 'schedule',
     scheduledAt: next.at,
     baseAt: next.baseAt,
-    jitterMinutes: next.jitterMinutes
+    jitterMinutes: next.jitterMinutes,
+    scheduleSource: next.scheduleSource,
+    dayKey: next.dayKey
   };
 }
 
@@ -544,7 +579,7 @@ async function runTelegramPoller() {
       const updates = await telegramApi('getUpdates', {
         offset: telegramState.offset,
         timeout: 30,
-        allowed_updates: ['message']
+        allowed_updates: ['message', 'callback_query']
       });
 
       for (const update of updates) {
@@ -560,7 +595,17 @@ async function runTelegramPoller() {
 }
 
 async function handleTelegramUpdate(update) {
-  const message = update.message;
+  if (update.callback_query) {
+    await handleTelegramCallback(update.callback_query);
+    return;
+  }
+
+  if (update.message) {
+    await handleTelegramMessage(update.message);
+  }
+}
+
+async function handleTelegramMessage(message) {
   if (!message?.chat?.id || !message.from) return;
 
   const username = normalizeUsername(message.from.username || '');
@@ -574,7 +619,7 @@ async function handleTelegramUpdate(update) {
 
   const text = (message.text || '').trim();
   if (!text.startsWith('/')) {
-    await sendTelegramMessage(message.chat.id, commandHelp());
+    await showMainMenu(message.chat.id);
     return;
   }
 
@@ -590,7 +635,7 @@ async function handleTelegramCommand(chatId, username, command, argsText) {
   switch (command) {
     case '/start':
     case '/help':
-      await sendTelegramMessage(chatId, commandHelp());
+      await showMainMenu(chatId);
       return;
     case '/status':
       await handleStatusCommand(chatId);
@@ -605,45 +650,61 @@ async function handleTelegramCommand(chatId, username, command, argsText) {
       await handleManualActionCommand(chatId, username, 'stop');
       return;
     case '/turnon':
-      runtimeState.automationEnabled = true;
-      await saveRuntimeState();
-      wakeMonitorLoop();
-      await emit(`Automatic schedule turned ON by @${username}.`);
+      await setAutomationEnabled(username, true);
+      await showMainMenu(chatId);
       return;
     case '/turnoff':
-      runtimeState.automationEnabled = false;
-      await saveRuntimeState();
-      wakeMonitorLoop();
-      await emit(`Automatic schedule turned OFF by @${username}.`);
+      await setAutomationEnabled(username, false);
+      await showMainMenu(chatId);
       return;
     case '/schedule':
-      await sendTelegramMessage(chatId, `Active schedule: ${getActiveSchedule()}\nSource: ${runtimeState.scheduleOverride ? 'Telegram override' : '.env'}`);
+      await showScheduleMenu(chatId);
       return;
     case '/setschedule':
       await handleSetScheduleCommand(chatId, username, argsText);
       return;
     case '/resetschedule':
       runtimeState.scheduleOverride = null;
-      await saveRuntimeState();
-      jitterOffsets.clear();
-      wakeMonitorLoop();
-      await emit(`Schedule reset to .env by @${username}. Active schedule: ${getActiveSchedule()}`);
+      await persistScheduleChange();
+      await emit(`Fallback schedule reset to .env by @${username}. Active fallback: ${getFallbackSchedule()}`);
+      await showScheduleMenu(chatId);
+      return;
+    case '/setdayschedule':
+      await handleSetDayScheduleCommand(chatId, username, argsText);
+      return;
+    case '/cleardayschedule':
+      await handleClearDayScheduleCommand(chatId, username, argsText);
+      return;
+    case '/resetweekschedule':
+      runtimeState.weeklyScheduleOverride = {};
+      await persistScheduleChange();
+      await emit(`Weekly schedule override reset by @${username}.`);
+      await showScheduleMenu(chatId);
       return;
     case '/report':
       await sendTelegramMessage(chatId, buildDailyReport(dateKey(new Date()), false));
       return;
     default:
-      await sendTelegramMessage(chatId, `Unknown command: ${command}\n\n${commandHelp()}`);
+      await sendTelegramMessage(chatId, `Unknown command: ${command}\n\n${commandHelp()}`, {
+        replyMarkup: mainMenuKeyboard()
+      });
   }
 }
 
 async function handleStatusCommand(chatId) {
-  const next = getNextAction(new Date(), getActiveEvents());
+  await sendTelegramMessage(chatId, await buildStatusText(), {
+    replyMarkup: mainMenuKeyboard()
+  });
+}
+
+async function buildStatusText() {
+  const next = getNextAction(new Date());
+  const today = getScheduleForDate(new Date());
   const statusLines = [
     `Automation: ${runtimeState.automationEnabled ? 'on' : 'off'}`,
     `Dry-run: ${config.dryRun ? 'on' : 'off'}`,
-    `Schedule: ${getActiveSchedule()}`,
-    `Next event: ${next.action.toUpperCase()} at ${formatDateTime(next.at)}${formatJitter(next.jitterMinutes)}`
+    `Today: ${formatScheduleForDisplay(today.schedule)} (${today.source})`,
+    `Next event: ${formatNextEvent(next)}`
   ];
 
   const stateCheck = runExclusive('status', inspectPromidState);
@@ -658,7 +719,7 @@ async function handleStatusCommand(chatId) {
     statusLines.push(`Promid state: unavailable (${formatError(error)})`);
   }
 
-  await sendTelegramMessage(chatId, statusLines.join('\n'));
+  return statusLines.join('\n');
 }
 
 async function handleManualActionCommand(chatId, username, action) {
@@ -680,32 +741,461 @@ async function handleSetScheduleCommand(chatId, username, argsText) {
   }
 
   try {
-    parseSchedule(argsText);
+    argsText = normalizeScheduleString(argsText);
   } catch (error) {
     await sendTelegramMessage(chatId, `Invalid schedule: ${formatError(error)}`);
     return;
   }
 
   runtimeState.scheduleOverride = argsText;
+  await persistScheduleChange();
+  await emit(`Fallback schedule override set by @${username}: ${argsText}`);
+  await showScheduleMenu(chatId);
+}
+
+async function handleSetDayScheduleCommand(chatId, username, argsText) {
+  const firstSpace = argsText.indexOf(' ');
+  if (firstSpace === -1) {
+    await sendTelegramMessage(chatId, 'Usage: /setdayschedule mon 06:00=start,09:00=stop');
+    return;
+  }
+
+  const dayKey = parseWorkdayKey(argsText.slice(0, firstSpace));
+  if (!dayKey) {
+    await sendTelegramMessage(chatId, 'Choose a weekday: mon, tue, wed, thu, or fri.');
+    return;
+  }
+
+  const scheduleText = argsText.slice(firstSpace + 1).trim();
+  try {
+    setWeeklyDaySchedule(dayKey, scheduleText);
+  } catch (error) {
+    await sendTelegramMessage(chatId, `Invalid ${WORKDAY_LABELS[dayKey]} schedule: ${formatError(error)}`);
+    return;
+  }
+
+  await persistScheduleChange();
+  await emit(`${WORKDAY_LABELS[dayKey]} schedule set by @${username}: ${formatScheduleForDisplay(getScheduleForDayKey(dayKey).schedule)}`);
+  await showDayEditor(chatId, dayKey);
+}
+
+async function handleClearDayScheduleCommand(chatId, username, argsText) {
+  const dayKey = parseWorkdayKey(argsText);
+  if (!dayKey) {
+    await sendTelegramMessage(chatId, 'Usage: /cleardayschedule mon');
+    return;
+  }
+
+  setWeeklyDaySchedule(dayKey, '');
+  await persistScheduleChange();
+  await emit(`${WORKDAY_LABELS[dayKey]} cleared by @${username}; no automatic events will run that day.`);
+  await showDayEditor(chatId, dayKey);
+}
+
+async function handleTelegramCallback(callback) {
+  const chatId = callback.message?.chat?.id;
+  if (!chatId || !callback.from) return;
+
+  const username = normalizeUsername(callback.from.username || '');
+  if (!config.telegramAllowedUsernames.has(username)) {
+    console.log(`Ignored Telegram button from unauthorized user: ${username || 'unknown'}`);
+    await answerTelegramCallback(callback.id, 'Not authorized').catch(() => {});
+    return;
+  }
+
+  registerTelegramChat(chatId, username);
+  await saveTelegramState();
+  await answerTelegramCallback(callback.id).catch((error) => {
+    console.log(`Telegram callback answer failed: ${formatError(error)}`);
+  });
+
+  try {
+    await routeTelegramCallback(callback, username);
+  } catch (error) {
+    await respondToCallback(callback, `Could not handle that button safely: ${formatError(error)}`, mainMenuKeyboard());
+  }
+}
+
+async function routeTelegramCallback(callback, username) {
+  const data = callback.data || '';
+  const parts = data.split(':');
+  const chatId = callback.message.chat.id;
+
+  if (data === 'main') {
+    setTelegramSession(chatId, { menu: 'main' });
+    await saveTelegramState();
+    await respondToCallback(callback, mainMenuText(), mainMenuKeyboard());
+    return;
+  }
+
+  if (data === 'status') {
+    await respondToCallback(callback, await buildStatusText(), mainMenuKeyboard());
+    return;
+  }
+
+  if (data === 'auto:toggle') {
+    await setAutomationEnabled(username, !runtimeState.automationEnabled);
+    await respondToCallback(callback, mainMenuText(), mainMenuKeyboard());
+    return;
+  }
+
+  if (data === 'report:today') {
+    await sendTelegramMessage(chatId, buildDailyReport(dateKey(new Date()), false));
+    return;
+  }
+
+  if (parts[0] === 'act') {
+    const action = parts[1];
+    if (!['start', 'lunch', 'stop'].includes(action)) throw new Error('Unknown action.');
+    await handleManualActionCommand(chatId, username, action);
+    return;
+  }
+
+  if (data === 'sched:menu' || data === 'sched:view') {
+    setTelegramSession(chatId, { menu: 'schedule' });
+    await saveTelegramState();
+    await respondToCallback(callback, scheduleMenuText(), scheduleMenuKeyboard());
+    return;
+  }
+
+  if (data === 'sched:resetweek') {
+    runtimeState.weeklyScheduleOverride = {};
+    await persistScheduleChange();
+    await emit(`Weekly schedule override reset by @${username}.`);
+    await respondToCallback(callback, scheduleMenuText(), scheduleMenuKeyboard());
+    return;
+  }
+
+  if (parts[0] === 'day') {
+    await handleDayCallback(callback, username, parts);
+    return;
+  }
+
+  if (parts[0] === 'addact' || parts[0] === 'addhour' || parts[0] === 'addmin') {
+    await handleAddEventCallback(callback, username, parts);
+    return;
+  }
+
+  if (parts[0] === 'del') {
+    await handleDeleteEventCallback(callback, username, parts);
+    return;
+  }
+
+  throw new Error('Unknown button.');
+}
+
+async function handleDayCallback(callback, username, parts) {
+  const [, command, rawDayKey] = parts;
+  const chatId = callback.message.chat.id;
+  const dayKey = requireWorkdayKey(rawDayKey);
+
+  if (command === 'edit') {
+    setTelegramSession(chatId, { menu: 'day', selectedDay: dayKey });
+    await saveTelegramState();
+    await respondToCallback(callback, dayEditorText(dayKey), dayEditorKeyboard(dayKey));
+    return;
+  }
+
+  if (command === 'add') {
+    setTelegramSession(chatId, { menu: 'day', flow: 'add_event', selectedDay: dayKey });
+    await saveTelegramState();
+    await respondToCallback(callback, addActionText(dayKey), addActionKeyboard(dayKey));
+    return;
+  }
+
+  if (command === 'delete') {
+    setTelegramSession(chatId, { menu: 'day', flow: 'delete_event', selectedDay: dayKey });
+    await saveTelegramState();
+    await respondToCallback(callback, deleteEventText(dayKey), deleteEventKeyboard(dayKey));
+    return;
+  }
+
+  if (command === 'copy') {
+    if (dayKey === 'mon') {
+      await respondToCallback(callback, dayEditorText(dayKey), dayEditorKeyboard(dayKey));
+      return;
+    }
+    setWeeklyDaySchedule(dayKey, getScheduleForDayKey('mon').schedule);
+    await persistScheduleChange();
+    await emit(`${WORKDAY_LABELS[dayKey]} copied from Monday by @${username}.`);
+    await respondToCallback(callback, dayEditorText(dayKey), dayEditorKeyboard(dayKey));
+    return;
+  }
+
+  if (command === 'clear') {
+    setWeeklyDaySchedule(dayKey, '');
+    await persistScheduleChange();
+    await emit(`${WORKDAY_LABELS[dayKey]} cleared by @${username}; no automatic events will run that day.`);
+    await respondToCallback(callback, dayEditorText(dayKey), dayEditorKeyboard(dayKey));
+    return;
+  }
+
+  if (command === 'save') {
+    setTelegramSession(chatId, { menu: 'schedule' });
+    await saveTelegramState();
+    await respondToCallback(callback, scheduleMenuText(), scheduleMenuKeyboard());
+    return;
+  }
+
+  throw new Error('Unknown day action.');
+}
+
+async function handleAddEventCallback(callback, username, parts) {
+  const chatId = callback.message.chat.id;
+  const section = parts[0];
+  const dayKey = requireWorkdayKey(parts[1]);
+  const session = getTelegramSession(chatId);
+
+  if (section === 'addact') {
+    const action = parts[2];
+    if (!['start', 'lunch', 'stop'].includes(action)) throw new Error('Unknown action.');
+    setTelegramSession(chatId, { menu: 'day', flow: 'add_event', selectedDay: dayKey, pendingAction: action });
+    await saveTelegramState();
+    await respondToCallback(callback, addHourText(dayKey, action), addHourKeyboard(dayKey));
+    return;
+  }
+
+  if (section === 'addhour') {
+    const action = session.pendingAction;
+    if (!['start', 'lunch', 'stop'].includes(action)) {
+      await respondToCallback(callback, addActionText(dayKey), addActionKeyboard(dayKey));
+      return;
+    }
+    const hour = Number(parts[2]);
+    validateTime(hour, 0, 'selected hour');
+    setTelegramSession(chatId, { ...session, menu: 'day', flow: 'add_event', selectedDay: dayKey, pendingHour: hour });
+    await saveTelegramState();
+    await respondToCallback(callback, addMinuteText(dayKey, action, hour), addMinuteKeyboard(dayKey));
+    return;
+  }
+
+  if (section === 'addmin') {
+    const action = session.pendingAction;
+    const hour = session.pendingHour;
+    if (!['start', 'lunch', 'stop'].includes(action) || !Number.isInteger(hour)) {
+      await respondToCallback(callback, addActionText(dayKey), addActionKeyboard(dayKey));
+      return;
+    }
+    const minute = Number(parts[2]);
+    validateTime(hour, minute, 'selected time');
+    if (minute % 5 !== 0) throw new Error('Minutes must use 5-minute steps.');
+
+    const added = addWeeklyDayEvent(dayKey, { action, time: { hour, minute } });
+    await persistScheduleChange();
+    setTelegramSession(chatId, { menu: 'day', selectedDay: dayKey });
+    await saveTelegramState();
+    await emit(`${WORKDAY_LABELS[dayKey]} event added by @${username}: ${formatEvent(added)}`);
+    await respondToCallback(callback, dayEditorText(dayKey), dayEditorKeyboard(dayKey));
+    return;
+  }
+
+  throw new Error('Unknown add-event step.');
+}
+
+async function handleDeleteEventCallback(callback, username, parts) {
+  const chatId = callback.message.chat.id;
+  const dayKey = requireWorkdayKey(parts[1]);
+  const index = Number(parts[2]);
+  const removed = deleteWeeklyDayEvent(dayKey, index);
+  await persistScheduleChange();
+  setTelegramSession(chatId, { menu: 'day', selectedDay: dayKey });
+  await saveTelegramState();
+  await emit(`${WORKDAY_LABELS[dayKey]} event deleted by @${username}: ${formatEvent(removed)}`);
+  await respondToCallback(callback, dayEditorText(dayKey), dayEditorKeyboard(dayKey));
+}
+
+async function setAutomationEnabled(username, enabled) {
+  runtimeState.automationEnabled = enabled;
   await saveRuntimeState();
-  jitterOffsets.clear();
   wakeMonitorLoop();
-  await emit(`Schedule override set by @${username}: ${argsText}`);
+  await emit(`Automatic schedule turned ${enabled ? 'ON' : 'OFF'} by @${username}.`);
+}
+
+async function showMainMenu(chatId) {
+  setTelegramSession(chatId, { menu: 'main' });
+  await saveTelegramState();
+  await sendTelegramMessage(chatId, mainMenuText(), {
+    replyMarkup: mainMenuKeyboard()
+  });
+}
+
+async function showScheduleMenu(chatId) {
+  setTelegramSession(chatId, { menu: 'schedule' });
+  await saveTelegramState();
+  await sendTelegramMessage(chatId, scheduleMenuText(), {
+    replyMarkup: scheduleMenuKeyboard()
+  });
+}
+
+async function showDayEditor(chatId, dayKey) {
+  setTelegramSession(chatId, { menu: 'day', selectedDay: dayKey });
+  await saveTelegramState();
+  await sendTelegramMessage(chatId, dayEditorText(dayKey), {
+    replyMarkup: dayEditorKeyboard(dayKey)
+  });
+}
+
+function mainMenuText() {
+  const today = getScheduleForDate(new Date());
+  return [
+    'Promid Manager',
+    `Automation: ${runtimeState.automationEnabled ? 'on' : 'off'}`,
+    `Dry-run: ${config.dryRun ? 'on' : 'off'}`,
+    `Today: ${formatScheduleForDisplay(today.schedule)} (${today.source})`,
+    `Next: ${formatNextEvent(getNextAction(new Date()))}`,
+    '',
+    'Use the buttons below.'
+  ].join('\n');
+}
+
+function mainMenuKeyboard() {
+  return inlineKeyboard([
+    [button('Status', 'status')],
+    [button('Start Work', 'act:start'), button('Lunch', 'act:lunch'), button('Stop Work', 'act:stop')],
+    [button(runtimeState.automationEnabled ? 'Turn Auto Off' : 'Turn Auto On', 'auto:toggle')],
+    [button('Schedule', 'sched:menu'), button('Report', 'report:today')]
+  ]);
+}
+
+function scheduleMenuText() {
+  return [
+    'Schedule',
+    `Fallback: ${getFallbackSchedule()} (${runtimeState.scheduleOverride ? 'Telegram override' : '.env'})`,
+    '',
+    formatWeeklySchedule()
+  ].join('\n');
+}
+
+function scheduleMenuKeyboard() {
+  return inlineKeyboard([
+    [button('View Week', 'sched:view')],
+    [button('Edit Monday', 'day:edit:mon'), button('Edit Tuesday', 'day:edit:tue')],
+    [button('Edit Wednesday', 'day:edit:wed'), button('Edit Thursday', 'day:edit:thu')],
+    [button('Edit Friday', 'day:edit:fri')],
+    [button('Reset Week Override', 'sched:resetweek')],
+    [button('Back', 'main')]
+  ]);
+}
+
+function dayEditorText(dayKey) {
+  const safeDayKey = requireWorkdayKey(dayKey);
+  const info = getScheduleForDayKey(safeDayKey);
+  const events = info.schedule ? parseSchedule(info.schedule) : [];
+  const lines = [
+    WORKDAY_LABELS[safeDayKey],
+    `Source: ${info.custom ? 'custom weekday schedule' : info.source}`,
+    `Schedule: ${formatScheduleForDisplay(info.schedule)}`
+  ];
+
+  if (events.length) {
+    lines.push('');
+    lines.push(...events.map((event, index) => `${index + 1}. ${formatEvent(event)}`));
+  }
+
+  return lines.join('\n');
+}
+
+function dayEditorKeyboard(dayKey) {
+  const safeDayKey = requireWorkdayKey(dayKey);
+  const rows = [
+    [button('Add Event', `day:add:${safeDayKey}`), button('Delete Event', `day:delete:${safeDayKey}`)]
+  ];
+  if (safeDayKey !== 'mon') {
+    rows.push([button('Copy From Monday', `day:copy:${safeDayKey}`)]);
+  }
+  rows.push([button('Clear Day', `day:clear:${safeDayKey}`), button('Save', `day:save:${safeDayKey}`)]);
+  rows.push([button('Back', 'sched:menu')]);
+  return inlineKeyboard(rows);
+}
+
+function addActionText(dayKey) {
+  const safeDayKey = requireWorkdayKey(dayKey);
+  return `${WORKDAY_LABELS[safeDayKey]}: choose event action.`;
+}
+
+function addActionKeyboard(dayKey) {
+  const safeDayKey = requireWorkdayKey(dayKey);
+  return inlineKeyboard([
+    [
+      button('Start', `addact:${safeDayKey}:start`),
+      button('Lunch', `addact:${safeDayKey}:lunch`),
+      button('Stop', `addact:${safeDayKey}:stop`)
+    ],
+    [button('Back', `day:edit:${safeDayKey}`)]
+  ]);
+}
+
+function addHourText(dayKey, action) {
+  const safeDayKey = requireWorkdayKey(dayKey);
+  return `${WORKDAY_LABELS[safeDayKey]} ${action.toUpperCase()}: choose hour.`;
+}
+
+function addHourKeyboard(dayKey) {
+  const safeDayKey = requireWorkdayKey(dayKey);
+  const rows = [];
+  for (let hour = 0; hour < 24; hour += 6) {
+    rows.push([0, 1, 2, 3, 4, 5].map((offset) => button(pad2(hour + offset), `addhour:${safeDayKey}:${hour + offset}`)));
+  }
+  rows.push([button('Back', `day:add:${safeDayKey}`)]);
+  return inlineKeyboard(rows);
+}
+
+function addMinuteText(dayKey, action, hour) {
+  const safeDayKey = requireWorkdayKey(dayKey);
+  return `${WORKDAY_LABELS[safeDayKey]} ${action.toUpperCase()} at ${pad2(hour)}: choose minute.`;
+}
+
+function addMinuteKeyboard(dayKey) {
+  const safeDayKey = requireWorkdayKey(dayKey);
+  const rows = [];
+  for (let minute = 0; minute < 60; minute += 20) {
+    rows.push([0, 5, 10, 15].map((offset) => button(pad2(minute + offset), `addmin:${safeDayKey}:${minute + offset}`)));
+  }
+  rows.push([button('Back', `day:add:${safeDayKey}`)]);
+  return inlineKeyboard(rows);
+}
+
+function deleteEventText(dayKey) {
+  const safeDayKey = requireWorkdayKey(dayKey);
+  const events = parseEditableDayEvents(safeDayKey);
+  if (!events.length) {
+    return `${WORKDAY_LABELS[safeDayKey]} has no events to delete.`;
+  }
+  return `${WORKDAY_LABELS[safeDayKey]}: choose event to delete.`;
+}
+
+function deleteEventKeyboard(dayKey) {
+  const safeDayKey = requireWorkdayKey(dayKey);
+  const events = parseEditableDayEvents(safeDayKey);
+  const rows = events.map((event, index) => [button(formatEvent(event), `del:${safeDayKey}:${index}`)]);
+  rows.push([button('Back', `day:edit:${safeDayKey}`)]);
+  return inlineKeyboard(rows);
+}
+
+function inlineKeyboard(inlineKeyboardRows) {
+  return {
+    inline_keyboard: inlineKeyboardRows
+  };
+}
+
+function button(text, callbackData) {
+  return {
+    text,
+    callback_data: callbackData
+  };
 }
 
 function commandHelp() {
   return [
-    'Promid Manager commands:',
-    '/status - show automation, schedule, next event, and Promid state',
-    '/startwork - run safe start action now',
-    '/lunch - run safe lunch action now',
-    '/stopwork - run safe stop action now',
-    '/turnon - enable automatic schedule',
-    '/turnoff - disable automatic schedule',
-    '/schedule - show active schedule',
-    '/setschedule 06:00=start,09:00=stop - override runtime schedule',
-    '/resetschedule - use .env schedule again',
-    '/report - send today report'
+    'Promid Manager',
+    'Use the buttons below for normal control.',
+    '',
+    'Hidden typed shortcuts still work:',
+    '/status, /startwork, /lunch, /stopwork, /turnon, /turnoff, /schedule, /report',
+    '/setschedule 06:00=start,09:00=stop',
+    '/setdayschedule mon 06:00=start,09:00=stop',
+    '/cleardayschedule mon',
+    '/resetschedule, /resetweekschedule'
   ].join('\n');
 }
 
@@ -735,20 +1225,74 @@ async function sendTelegramToAll(text) {
   }
 }
 
-async function sendTelegramMessage(chatId, text) {
+async function sendTelegramMessage(chatId, text, options = {}) {
   if (config.telegramDryRun) {
-    console.log(`[telegram dry-run -> ${chatId}] ${text}`);
+    console.log(`[telegram dry-run -> ${chatId}] ${text}${options.replyMarkup ? `\n${JSON.stringify(options.replyMarkup)}` : ''}`);
     return;
   }
   if (!config.telegramToken) return;
 
-  for (const chunk of chunkText(text, 3900)) {
+  const chunks = chunkText(text, 3900);
+  for (let index = 0; index < chunks.length; index += 1) {
+    const isLastChunk = index === chunks.length - 1;
     await telegramApi('sendMessage', {
       chat_id: chatId,
-      text: chunk,
-      disable_web_page_preview: true
+      text: chunks[index],
+      disable_web_page_preview: true,
+      ...(isLastChunk && options.replyMarkup ? { reply_markup: options.replyMarkup } : {})
     });
   }
+}
+
+async function editTelegramMessage(chatId, messageId, text, replyMarkup) {
+  if (config.telegramDryRun) {
+    console.log(`[telegram dry-run edit -> ${chatId}/${messageId}] ${text}${replyMarkup ? `\n${JSON.stringify(replyMarkup)}` : ''}`);
+    return;
+  }
+  if (!config.telegramToken) return;
+
+  await telegramApi('editMessageText', {
+    chat_id: chatId,
+    message_id: messageId,
+    text,
+    disable_web_page_preview: true,
+    ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+  });
+}
+
+async function respondToCallback(callback, text, replyMarkup) {
+  const chatId = callback.message?.chat?.id;
+  const messageId = callback.message?.message_id;
+  if (!chatId) return;
+
+  if (messageId) {
+    try {
+      await editTelegramMessage(chatId, messageId, text, replyMarkup);
+      return;
+    } catch (error) {
+      const message = formatError(error);
+      if (!/message is not modified/i.test(message)) {
+        console.log(`Telegram edit failed, sending a new message instead: ${message}`);
+        await sendTelegramMessage(chatId, text, { replyMarkup });
+      }
+      return;
+    }
+  }
+
+  await sendTelegramMessage(chatId, text, { replyMarkup });
+}
+
+async function answerTelegramCallback(callbackId, text = '') {
+  if (config.telegramDryRun) {
+    console.log(`[telegram dry-run answer callback] ${text || 'ok'}`);
+    return;
+  }
+  if (!config.telegramToken) return;
+
+  await telegramApi('answerCallbackQuery', {
+    callback_query_id: callbackId,
+    ...(text ? { text } : {})
+  });
 }
 
 async function emit(text) {
@@ -787,6 +1331,8 @@ async function recordAction(result, context = {}) {
     scheduledAt: context.scheduledAt ? new Date(context.scheduledAt).toISOString() : null,
     baseAt: context.baseAt ? new Date(context.baseAt).toISOString() : null,
     jitterMinutes: context.jitterMinutes ?? null,
+    scheduleSource: context.scheduleSource || null,
+    dayKey: context.dayKey || null,
     action: result.action,
     status: result.status,
     reason: result.reason || null,
@@ -797,8 +1343,8 @@ async function recordAction(result, context = {}) {
   await saveRuntimeState();
 }
 
-async function maybeSendDailyReport(next, events) {
-  if (!isLastEventOfDay(next, events)) return;
+async function maybeSendDailyReport(next) {
+  if (!isLastEventOfDay(next)) return;
 
   const reportDate = dateKey(next.baseAt);
   const day = ensureRuntimeDay(reportDate);
@@ -869,7 +1415,8 @@ function calculateObservedWorkDuration(events) {
   return { ms: totalMs, partial };
 }
 
-function isLastEventOfDay(next, events) {
+function isLastEventOfDay(next) {
+  const events = getEventsForDate(next.baseAt);
   const sameDayEvents = events
     .map((event) => ({ event, at: dateAt(next.baseAt, 0, event.time) }))
     .filter((candidate) => dateKey(candidate.at) === dateKey(next.baseAt))
@@ -887,6 +1434,7 @@ function defaultRuntimeState() {
   return {
     automationEnabled: true,
     scheduleOverride: null,
+    weeklyScheduleOverride: {},
     days: {}
   };
 }
@@ -894,7 +1442,8 @@ function defaultRuntimeState() {
 function defaultTelegramState() {
   return {
     offset: 0,
-    chats: []
+    chats: [],
+    sessions: {}
   };
 }
 
@@ -902,7 +1451,8 @@ async function loadRuntimeState() {
   const loaded = await loadJson(config.runtimeStatePath, defaultRuntimeState());
   return {
     automationEnabled: loaded.automationEnabled !== false,
-    scheduleOverride: typeof loaded.scheduleOverride === 'string' && loaded.scheduleOverride ? loaded.scheduleOverride : null,
+    scheduleOverride: normalizeLoadedScheduleOverride(loaded.scheduleOverride),
+    weeklyScheduleOverride: normalizeLoadedWeeklySchedule(loaded.weeklyScheduleOverride),
     days: loaded.days && typeof loaded.days === 'object' ? loaded.days : {}
   };
 }
@@ -915,7 +1465,8 @@ async function loadTelegramState() {
   const loaded = await loadJson(config.telegramStatePath, defaultTelegramState());
   return {
     offset: Number.isInteger(loaded.offset) ? loaded.offset : 0,
-    chats: Array.isArray(loaded.chats) ? loaded.chats : []
+    chats: Array.isArray(loaded.chats) ? loaded.chats : [],
+    sessions: loaded.sessions && typeof loaded.sessions === 'object' ? loaded.sessions : {}
   };
 }
 
@@ -943,12 +1494,88 @@ async function saveJson(file, data) {
   await fs.writeFile(file, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
 }
 
-function getActiveSchedule() {
+async function persistScheduleChange() {
+  await saveRuntimeState();
+  jitterOffsets.clear();
+  lastNextNoticeKey = undefined;
+  wakeMonitorLoop();
+}
+
+function normalizeLoadedScheduleOverride(value) {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  try {
+    return normalizeScheduleString(value);
+  } catch (error) {
+    console.log(`Ignoring invalid saved fallback schedule override: ${formatError(error)}`);
+    return null;
+  }
+}
+
+function normalizeLoadedWeeklySchedule(value) {
+  const normalized = {};
+  if (!value || typeof value !== 'object') return normalized;
+
+  for (const dayKey of WORKDAY_KEYS) {
+    if (!Object.hasOwn(value, dayKey) || typeof value[dayKey] !== 'string') continue;
+    try {
+      normalized[dayKey] = value[dayKey].trim() ? normalizeScheduleString(value[dayKey]) : '';
+    } catch (error) {
+      console.log(`Ignoring invalid saved ${WORKDAY_LABELS[dayKey]} schedule override: ${formatError(error)}`);
+    }
+  }
+
+  return normalized;
+}
+
+function getFallbackSchedule() {
   return runtimeState.scheduleOverride || config.schedule;
 }
 
+function getActiveSchedule() {
+  return getFallbackSchedule();
+}
+
 function getActiveEvents() {
-  return parseSchedule(getActiveSchedule());
+  return getEventsForDate(new Date());
+}
+
+function getScheduleForDate(date) {
+  const dayKey = dayKeyForDate(date);
+  if (!dayKey || !isActiveWorkday(date)) {
+    return {
+      dayKey: null,
+      schedule: '',
+      source: 'weekend/off day',
+      custom: false
+    };
+  }
+
+  return getScheduleForDayKey(dayKey);
+}
+
+function getScheduleForDayKey(dayKey) {
+  const safeDayKey = requireWorkdayKey(dayKey);
+  const hasCustom = Object.hasOwn(runtimeState.weeklyScheduleOverride || {}, safeDayKey);
+  if (hasCustom) {
+    return {
+      dayKey: safeDayKey,
+      schedule: runtimeState.weeklyScheduleOverride[safeDayKey],
+      source: `${WORKDAY_LABELS[safeDayKey]} custom`,
+      custom: true
+    };
+  }
+
+  return {
+    dayKey: safeDayKey,
+    schedule: getFallbackSchedule(),
+    source: runtimeState.scheduleOverride ? 'fallback Telegram override' : '.env fallback',
+    custom: false
+  };
+}
+
+function getEventsForDate(date) {
+  const schedule = getScheduleForDate(date).schedule;
+  return schedule ? parseSchedule(schedule) : [];
 }
 
 function getActionConfig(action) {
@@ -975,15 +1602,78 @@ function parseSchedule(value) {
   });
 
   if (!events.length) throw new Error('PROMID_SCHEDULE cannot be empty.');
+  return sortEvents(validateUniqueEventTimes(events));
+}
+
+function normalizeScheduleString(value) {
+  return scheduleStringFromEvents(parseSchedule(value));
+}
+
+function scheduleStringFromEvents(events) {
+  return sortEvents(validateUniqueEventTimes(events)).map(formatEventForSchedule).join(',');
+}
+
+function validateUniqueEventTimes(events) {
+  const seen = new Set();
+  for (const event of events) {
+    const key = `${pad2(event.time.hour)}:${pad2(event.time.minute)}`;
+    if (seen.has(key)) {
+      throw new Error(`Duplicate schedule time: ${key}. Use only one action per timestamp.`);
+    }
+    seen.add(key);
+  }
   return events;
 }
 
-function getNextAction(now, events) {
+function sortEvents(events) {
+  return [...events].sort((a, b) => {
+    const byHour = a.time.hour - b.time.hour;
+    if (byHour) return byHour;
+    return a.time.minute - b.time.minute;
+  });
+}
+
+function parseEditableDayEvents(dayKey) {
+  const info = getScheduleForDayKey(dayKey);
+  return info.schedule ? parseSchedule(info.schedule) : [];
+}
+
+function setWeeklyDaySchedule(dayKey, schedule) {
+  const safeDayKey = requireWorkdayKey(dayKey);
+  runtimeState.weeklyScheduleOverride ||= {};
+  runtimeState.weeklyScheduleOverride[safeDayKey] = schedule.trim() ? normalizeScheduleString(schedule) : '';
+}
+
+function addWeeklyDayEvent(dayKey, event) {
+  const safeDayKey = requireWorkdayKey(dayKey);
+  validateTime(event.time.hour, event.time.minute, formatEvent(event));
+  const events = parseEditableDayEvents(safeDayKey);
+  validateUniqueEventTimes([...events, event]);
+  setWeeklyDaySchedule(safeDayKey, scheduleStringFromEvents([...events, event]));
+  return event;
+}
+
+function deleteWeeklyDayEvent(dayKey, index) {
+  const safeDayKey = requireWorkdayKey(dayKey);
+  const events = parseEditableDayEvents(safeDayKey);
+  if (!Number.isInteger(index) || index < 0 || index >= events.length) {
+    throw new Error('Selected event no longer exists.');
+  }
+  const [removed] = events.splice(index, 1);
+  setWeeklyDaySchedule(safeDayKey, events.length ? scheduleStringFromEvents(events) : '');
+  return removed;
+}
+
+function getNextAction(now) {
   const candidates = [];
   for (let dayOffset = 0; dayOffset <= 14; dayOffset += 1) {
+    const candidateDate = new Date(now);
+    candidateDate.setDate(candidateDate.getDate() + dayOffset);
+    const scheduleInfo = getScheduleForDate(candidateDate);
+    const events = scheduleInfo.schedule ? parseSchedule(scheduleInfo.schedule) : [];
     for (const event of events) {
       const baseAt = dateAt(now, dayOffset, event.time);
-      if (!config.activeDays.has(baseAt.getDay())) {
+      if (!isActiveWorkday(baseAt)) {
         continue;
       }
       const jitterMinutes = getJitterMinutes(baseAt, event);
@@ -991,7 +1681,9 @@ function getNextAction(now, events) {
         action: event.action,
         at: addMinutes(baseAt, jitterMinutes),
         baseAt,
-        jitterMinutes
+        jitterMinutes,
+        dayKey: scheduleInfo.dayKey,
+        scheduleSource: scheduleInfo.source
       });
     }
   }
@@ -1000,11 +1692,7 @@ function getNextAction(now, events) {
     .filter((candidate) => candidate.at.getTime() > now.getTime())
     .sort((a, b) => a.at.getTime() - b.at.getTime())[0];
 
-  if (!next) {
-    throw new Error('No upcoming actions found. Check PROMID_SCHEDULE and PROMID_ACTIVE_DAYS.');
-  }
-
-  return next;
+  return next || null;
 }
 
 function getJitterMinutes(baseAt, event) {
@@ -1050,11 +1738,11 @@ function dateKey(date) {
 }
 
 function eventKey(event) {
-  return `${event.action}|${event.at.toISOString()}|${event.baseAt.toISOString()}`;
+  return `${event.action}|${event.at.toISOString()}|${event.baseAt.toISOString()}|${event.dayKey || ''}|${event.scheduleSource || ''}`;
 }
 
 function validateTime(hour, minute, source) {
-  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+  if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
     throw new Error(`Invalid time in ${source}.`);
   }
 }
@@ -1138,9 +1826,91 @@ function normalizeUsername(value) {
     .toLowerCase();
 }
 
+function getTelegramSession(chatId) {
+  telegramState.sessions ||= {};
+  return telegramState.sessions[String(chatId)] || {};
+}
+
+function setTelegramSession(chatId, session) {
+  telegramState.sessions ||= {};
+  telegramState.sessions[String(chatId)] = {
+    ...session,
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function parseWorkdayKey(value) {
+  const lower = String(value || '').trim().toLowerCase();
+  const aliases = {
+    1: 'mon',
+    monday: 'mon',
+    mon: 'mon',
+    2: 'tue',
+    tuesday: 'tue',
+    tue: 'tue',
+    tues: 'tue',
+    3: 'wed',
+    wednesday: 'wed',
+    wed: 'wed',
+    4: 'thu',
+    thursday: 'thu',
+    thu: 'thu',
+    thur: 'thu',
+    thurs: 'thu',
+    5: 'fri',
+    friday: 'fri',
+    fri: 'fri'
+  };
+  return aliases[lower] || null;
+}
+
+function requireWorkdayKey(value) {
+  const dayKey = parseWorkdayKey(value);
+  if (!dayKey) {
+    throw new Error('Only Monday-Friday schedules are available; weekends stay disabled.');
+  }
+  return dayKey;
+}
+
+function dayKeyForDate(date) {
+  return DAY_NUMBER_TO_WORKDAY[date.getDay()] || null;
+}
+
+function isActiveWorkday(date) {
+  const day = date.getDay();
+  return day >= 1 && day <= 5 && config.activeDays.has(day);
+}
+
 function formatActiveDays(activeDays) {
   const names = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   return [...activeDays].sort((a, b) => a - b).map((day) => names[day]).join(', ');
+}
+
+function formatWeeklySchedule() {
+  const lines = ['Monday-Friday effective schedules:'];
+  for (const dayKey of WORKDAY_KEYS) {
+    const info = getScheduleForDayKey(dayKey);
+    lines.push(`${WORKDAY_LABELS[dayKey]}: ${formatScheduleForDisplay(info.schedule)} (${info.custom ? 'custom' : 'fallback'})`);
+  }
+  return lines.join('\n');
+}
+
+function formatScheduleForDisplay(schedule) {
+  return schedule ? schedule : 'No events';
+}
+
+function formatEvent(event) {
+  return `${pad2(event.time.hour)}:${pad2(event.time.minute)} ${event.action.toUpperCase()}`;
+}
+
+function formatEventForSchedule(event) {
+  return `${pad2(event.time.hour)}:${pad2(event.time.minute)}=${event.action}`;
+}
+
+function formatNextEvent(next) {
+  if (!next) return 'none';
+  const source = next.scheduleSource ? ` (${next.scheduleSource})` : '';
+  return `${next.action.toUpperCase()} at ${formatDateTime(next.at)}${formatJitter(next.jitterMinutes)}${source}`;
 }
 
 function formatJitter(jitterMinutes) {
@@ -1208,6 +1978,60 @@ function chunkText(text, size) {
     chunks.push(text.slice(index, index + size));
   }
   return chunks.length ? chunks : [''];
+}
+
+function runTelegramUiSelfTest() {
+  const originalRuntimeState = runtimeState;
+  const originalTelegramState = telegramState;
+  try {
+    runtimeState = defaultRuntimeState();
+    telegramState = defaultTelegramState();
+    runtimeState.scheduleOverride = '08:00=start,10:00=stop';
+    runtimeState.weeklyScheduleOverride = {
+      mon: '06:00=start,09:00=stop',
+      tue: '07:00=start,12:00=lunch,12:30=start,16:00=stop'
+    };
+
+    assertSelfTest(parseWorkdayKey('sat') === null, 'Saturday must not be editable.');
+    assertSelfTest(dayKeyForDate(new Date(2026, 5, 1)) === 'mon', 'Self-test date should be Monday.');
+
+    const mondayNext = getNextAction(new Date(2026, 5, 1, 5, 0, 0));
+    assertSelfTest(mondayNext?.action === 'start', 'Monday next action should use Monday override.');
+    assertSelfTest(mondayNext?.baseAt.getHours() === 6, 'Monday next action should be 06:00.');
+
+    const tuesdayNext = getNextAction(new Date(2026, 5, 2, 6, 0, 0));
+    assertSelfTest(tuesdayNext?.action === 'start', 'Tuesday next action should use Tuesday override.');
+    assertSelfTest(tuesdayNext?.baseAt.getHours() === 7, 'Tuesday next action should be 07:00.');
+
+    const wednesdayNext = getNextAction(new Date(2026, 5, 3, 7, 0, 0));
+    assertSelfTest(wednesdayNext?.baseAt.getHours() === 8, 'Missing weekday override should fall back.');
+
+    const fridayAfterWork = getNextAction(new Date(2026, 5, 5, 23, 0, 0));
+    assertSelfTest(fridayAfterWork?.baseAt.getDay() === 1, 'Weekend must be skipped.');
+
+    let duplicateRejected = false;
+    try {
+      addWeeklyDayEvent('mon', { action: 'lunch', time: { hour: 6, minute: 0 } });
+    } catch {
+      duplicateRejected = true;
+    }
+    assertSelfTest(duplicateRejected, 'Duplicate weekday times should be rejected.');
+
+    setWeeklyDaySchedule('fri', '');
+    assertSelfTest(getEventsForDate(new Date(2026, 5, 5)).length === 0, 'Cleared Friday should have no events.');
+    assertSelfTest(scheduleMenuKeyboard().inline_keyboard.flat().every((item) => !/sat|sun/i.test(item.callback_data)), 'Weekend callbacks must not be rendered.');
+
+    console.log('Telegram UI self-test passed.');
+  } finally {
+    runtimeState = originalRuntimeState;
+    telegramState = originalTelegramState;
+  }
+}
+
+function assertSelfTest(condition, message) {
+  if (!condition) {
+    throw new Error(`Self-test failed: ${message}`);
+  }
 }
 
 function pad2(value) {
