@@ -241,6 +241,12 @@ Notes for Docker:
 ## 6. Useful `.env` Options
 
 ```env
+TZ=Europe/Helsinki
+```
+
+Use Helsinki local time for scheduled events and status output. Docker sets this automatically.
+
+```env
 PROMID_DRY_RUN=true
 ```
 

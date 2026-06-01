@@ -8,6 +8,7 @@ RUN npm ci --omit=dev
 COPY . .
 
 ENV NODE_ENV=production
+ENV TZ=Europe/Helsinki
 ENV PROMID_HEADLESS=true
 ENV PROMID_LOGIN_STATE_PATH=/app/.auth/promid-state.json
 

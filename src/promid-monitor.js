@@ -4,9 +4,12 @@ import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { chromium } from 'playwright';
 
+const DEFAULT_TIME_ZONE = 'Europe/Helsinki';
+process.env.TZ ||= DEFAULT_TIME_ZONE;
 const env = process.env;
 
 const config = {
+  timeZone: env.TZ,
   url: env.PROMID_URL || 'https://metropolia.promid.fi/',
   email: env.PROMID_EMAIL,
   password: env.PROMID_PASSWORD,
@@ -100,6 +103,7 @@ async function main() {
   await emit(`Promid monitor started.
 Fallback schedule: ${getFallbackSchedule()}
 Active days: ${formatActiveDays(config.activeDays)}
+Timezone: ${config.timeZone}
 Automation: ${runtimeState.automationEnabled ? 'on' : 'off'}
 Telegram: ${telegramModeLabel()}`);
   if (config.jitterMinutes > 0) {
@@ -703,6 +707,7 @@ async function buildStatusText() {
   const statusLines = [
     `Automation: ${runtimeState.automationEnabled ? 'on' : 'off'}`,
     `Dry-run: ${config.dryRun ? 'on' : 'off'}`,
+    `Timezone: ${config.timeZone}`,
     `Today: ${formatScheduleForDisplay(today.schedule)} (${today.source})`,
     `Next event: ${formatNextEvent(next)}`
   ];
